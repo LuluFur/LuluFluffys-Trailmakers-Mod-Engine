@@ -41,3 +41,7 @@ coverage/
 # Local planning / design notes — never tracked
 .planning/
 planning/
+
+# Temp review/response files — local only
+followup.md
+responses.md
