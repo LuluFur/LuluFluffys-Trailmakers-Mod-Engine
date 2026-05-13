@@ -18,7 +18,7 @@ Events use Roblox's `RBXScriptSignal` pattern. Each host `tm.*.OnX` event is wra
 
 ## ChatService — confirmed mapping
 
-The chat surface has two methods, mapped to two distinct host UI elements. `Chat:SendMessageTo(player, msg)` calls `tm.playerUI.SendChatMessage` under the hood — this is the scrolling chat box, low priority, attributed to a sender name. `Chat:BroadcastToAll(header, msg)` calls `tm.playerUI.ShowIntrusiveMessageForAllPlayers` — this is the center-screen intrusive popup, high priority, with a header and a duration. The engine hides the host-API quirk that `SendChatMessage` is technically broadcast-attributed-to-sender; the caller does not need to know.
+The chat surface has two methods, mapped to two distinct host UI elements. `Chat:SendMessageTo(player, msg)` calls `tm.playerUI.SendChatMessage` under the hood — this is the in-game chat panel, lower priority than intrusive popups, attributed to a sender name. `Chat:BroadcastToAll(header, msg)` calls `tm.playerUI.ShowIntrusiveMessageForAllPlayers` — this is the center-screen intrusive popup, high priority, with a header and a duration. The engine hides the host-API quirk that `SendChatMessage` is technically broadcast-attributed-to-sender; the caller does not need to know.
 
 ## Boundary rule — service vs player object
 
