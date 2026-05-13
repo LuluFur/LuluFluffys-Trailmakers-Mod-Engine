@@ -89,7 +89,7 @@ Chat:BroadcastToAll():Header("Warning"):Body("Server restarting"):Duration(10)
 works. Player mutator chains read well too:
 
 ```lua
-Players:FindByName("Lewis"):Teleport(v3):Heal(100)
+Players:FindByName("Player123"):Teleport(v3):Heal(100)
 ```
 
 Methods that return data (`player:GetPosition()`, `Players:GetPlayers()`) obviously do not chain — the return value is the data, not `self`.
