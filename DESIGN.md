@@ -12,7 +12,7 @@ The intended user is a hobbyist mod author who wants to ship a working gameplay 
 
 ## 2. Entry point and singleton model
 
-A mod boots by constructing the engine exactly once. The engine is a process-wide singleton: a second construction attempt is a programmer error.
+A mod boots by constructing the engine exactly once. The engine is a singleton within the current Lua runtime / mod environment: a second construction attempt is a programmer error. If the host loads multiple mods into the same Lua state, those mods share the same LFTME singleton; if each mod runs in its own Lua state, each gets its own.
 
 ```lua
 local engine = LuluFluffysTrailmakersModEngine.New()
@@ -31,11 +31,21 @@ Both names are reachable as globals. They are the only globals the engine create
 ```lua
 local engine, err = LFTME.Get()
 if not engine then
+    error(err)
+end
+```
+
+`LFTME.Get()` returns the existing instance, or `nil, err` if the engine has not yet been constructed. It never throws. This makes `Get()` safe to call from library code, deferred callbacks, or mod-internal modules that may load before or after the engine boots. When a `Logger` is not yet available in the example context — as in the boot sequence above — `error(err)` is the simplest correct handling. In contexts where a logger or `print` is available, the equivalent pattern is to log and return:
+
+```lua
+local engine, err = LFTME.Get()
+if not engine then
+    print(err)
     return
 end
 ```
 
-`LFTME.Get()` returns the existing instance, or `nil, err` if the engine has not yet been constructed. It never throws. This makes `Get()` safe to call from library code, deferred callbacks, or mod-internal modules that may load before or after the engine boots.
+The one pattern to avoid in beginner-facing examples is the silent `return` without any reporting, because copy-paste tends to spread silent failures.
 
 Services are obtained from the engine instance using `:GetService("ServiceName")`, mirroring Roblox style:
 
@@ -109,13 +119,14 @@ A popup builder reads the same way:
 Chat:BroadcastToAll():Header("Warning"):Body("Server restarting"):Duration(10)
 ```
 
-Player mutator chains work too:
+Player mutator chains work too, but only across true mutators. Because `SpawnObjectNearby` returns the spawned object rather than the player, it is the natural terminus when present:
 
 ```lua
-Players:FindByName("Player123"):Teleport(0, 310, 0):Eject():SpawnObjectNearby("PFB_Metal_Crate")
+local player = Players:FindByName("Player123"):Teleport(0, 310, 0):Eject()
+local crate = player:SpawnObjectNearby("PFB_Metal_Crate"):Scale(2, 2, 2)
 ```
 
-The terminal call returns the configured object, so the chain ends naturally when the user stops typing dots. Single-call uses still work — `ObjectSpawner:SpawnObject("PFB_Metal_Crate")` is a valid expression that spawns at the default position and returns a `SpawnedObject`. Two-or-fewer positional arguments stay positional and unchained when that reads more naturally; chained setters are reserved for cases with a real configuration surface.
+The first line is a pure player-mutator chain that ends with a `Player`. The second line hands off to the spawned crate and chains a single mutator on it. The terminal call returns the configured object, so the chain ends naturally when the user stops typing dots. Single-call uses still work — `ObjectSpawner:SpawnObject("PFB_Metal_Crate")` is a valid expression that spawns at the default position and returns a `SpawnedObject`. Two-or-fewer positional arguments stay positional and unchained when that reads more naturally; chained setters are reserved for cases with a real configuration surface.
 
 Spawn semantics are eager. The host call (`tm.physics.SpawnObject` under the hood) fires on the first method in the chain, and chained setters mutate the live object in place. The engine guarantees that all chained setters in a single statement run before the next physics step, so the object never visibly appears at the origin then teleports. There is no "pop" between initial spawn and final configuration. This is a documented guarantee, not best-effort.
 
@@ -135,7 +146,15 @@ end)
 
 Yielding is documented on every public method. The two yielding primitives the engine exposes are `Signal:Wait()` and `task.wait(seconds)`. Both yield via `coroutine.yield` and are resumed by the engine scheduler driven from `UpdateService.OnUpdate`. The engine never busy-waits on `tm.os.GetTime`; busy-waiting would freeze the mod frame.
 
-Runtime enforcement is light. The engine asserts when `task.wait` is called outside a scheduler-managed coroutine, because that case is genuinely dangerous (the wait would never resume). Other methods are documented as yielding or non-yielding but not wrapped in guards. Wrapping every method to enforce annotations would add overhead without proportional safety.
+Runtime enforcement is light but covers the two yielding primitives symmetrically. The engine asserts when either `task.wait` or `Signal:Wait` is called outside a scheduler-managed coroutine, because in both cases the yield would never be resumed by the engine and the calling code would silently stall in production. Other methods are documented as yielding or non-yielding but not wrapped in guards. Wrapping every method to enforce annotations would add overhead without proportional safety.
+
+The guard error uses the runtime-failure template. For example:
+
+```text
+Signal:Wait(main.lua:34) cannot yield from an unmanaged coroutine. Use task.spawn(function() ... end).
+```
+
+The `task.wait` form is identical except for the method name in the prefix.
 
 ### Error handling
 
@@ -143,7 +162,9 @@ The engine uses two error conventions, picked by category. Programmer errors thr
 
 A programmer error is something only a code bug can cause: passing the wrong type, passing `nil` where a value is required, double-destroying an object. The engine throws because the call site is unrecoverable and the programmer needs the traceback. An expected failure is something that depends on runtime state: a player not currently online, a prefab name that doesn't match anything, a storage key that hasn't been written. The engine returns `nil, err` because the caller is expected to handle that case.
 
-Every engine error message follows a single format:
+Every engine error message follows one of two closely related templates, picked by the kind of failure. The two templates share the same prefix so messages always start with the same shape — `<ClassOrService>:<Method>(<file>:<line>)` — and diverge only in the trailing detail.
+
+The **type-error template** is used for parameter typechecks, where the failure can be expressed as "wrong type for this parameter":
 
 ```text
 <ClassOrService>:<Method>(<file>:<line>) expected <expectedType> for parameter "<paramName>", got <actualType> <actualValue>
@@ -162,6 +183,32 @@ Chat:SendMessageTo(main.lua:45) expected Player for parameter "player", got nil
 ```text
 ObjectSpawner:SpawnObject(main.lua:88) expected string or Enum.Block for parameter "prefab", got table
 ```
+
+The **runtime-failure template** is used for everything else — failures that depend on runtime state rather than parameter shape: a prefab name that does not resolve, an engine that already exists, a player that is offline, a storage key that is missing. The template carries a free-form message after the prefix:
+
+```text
+<ClassOrService>:<Method>(<file>:<line>) <message>
+```
+
+Concrete examples:
+
+```text
+ObjectSpawner:SpawnObject(main.lua:52) could not resolve prefab "metal".
+```
+
+```text
+ObjectSpawner:SpawnObject(main.lua:52) prefab name "crate" is ambiguous.
+```
+
+```text
+LFTME.New(main.lua:12) engine instance already exists.
+```
+
+```text
+Players:FindByName(main.lua:30) no player matched "Player123".
+```
+
+The prefab-resolution examples later in section 6 use this second template; they are not exceptions to a one-size-fits-all format but instances of the runtime-failure pattern. Contributors picking between templates should default to the type-error form whenever the failure is "wrong type for parameter X" and to the runtime-failure form otherwise. Both flow through `util/Typecheck.lua` so the prefix stays consistent.
 
 The file and line come from `debug.getinfo(level, "Sl")` walked back to the user's call site. String values are quoted (`got string "Metal_Crate"`). Large tables are not dumped wholesale — they are summarised as `got table 0x123456` or `got table with keys {Name, Position}` to keep messages readable. Numbers, booleans, and `nil` are printed verbatim.
 
@@ -224,6 +271,16 @@ Chat:BroadcastToAll("Alert", "<b>Server</b> restarting")
 
 works without any builder involvement. Chat panel lines (`Chat:SendMessageTo`) do not support formatting tags — the host renders them as plain text — and the engine documents this rather than silently stripping or converting.
 
+Because intrusive popups pass tags through, any user-supplied substring — most commonly a player name — is interpolated raw and may produce accidental formatting if it happens to contain markup-like characters. The engine ships a small escape helper for the common case:
+
+```lua
+local safeName = MarkupText.escape(player.Name)
+local greeting = MarkupText.new("Welcome, " .. safeName):Bold()
+Chat:BroadcastToAll("Greeting", tostring(greeting))
+```
+
+`MarkupText.escape(text)` returns a new string with HTML-like characters (`<`, `>`, `&`, `"`, `'`) replaced by their entity equivalents, so the result is safe to splice into a popup body. Raw strings passed without `escape` are not filtered by either `MarkupText.new` or `Chat:BroadcastToAll`; the engine is deliberately a thin layer over the host's markup surface and trusts the caller to escape untrusted text.
+
 ## 6. Services
 
 Services are the main public surface. Every service is obtained the same way (`engine:GetService("Name")`) and follows the conventions in section 4. The sections below describe each service's behaviour, signals, and important quirks.
@@ -244,7 +301,7 @@ end)
 
 The event names are deliberately Trailmakers-clear rather than strict Roblox tense (`PlayerAdded`/`PlayerRemoving`). The Trailmakers session model is "a server with players joining and leaving", and the names should say exactly that. `PlayerLeftServer` fires after the host reports the disconnect, but the wrapped `Player` object is still queryable for `Name`, `Id`, and any engine-cached state for the duration of the dispatch. After the dispatch returns, the engine drops its references to that player.
 
-Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(x, y, z)` or `Teleport(Vector3)`, `Kick(reason)`, `Kill()`, `Eject()`, `SetTeam(n)`, `SetInvincible(bool)`, `SetJetpackEnabled(bool)`, `SpawnObjectNearby(prefab, offset?)`), and query methods (`GetPosition()`, `IsInSeat()`). Mutators return `self` for chaining; queries return values. `Teleport` accepts either three positional numbers or a single `Vector3`. `SpawnObjectNearby` is sugar that reads the player position, applies an optional local offset, and routes through `ObjectSpawner:SpawnObject`; it returns `self` (the player) for continued chaining — the spawned object handle is recoverable through `ObjectSpawner:Find` if needed. `Kick(reason)` accepts a reason string for the modder's convenience, but the host call `tm.players.Kick(playerId)` does not deliver the reason to the kicked player — the value is logged engine-side via `Logger:Info` and then discarded. Treat the reason as an audit-log message, not a user-facing notice. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
+Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(x, y, z)` or `Teleport(Vector3)`, `Kick(reason)`, `Kill()`, `Eject()`, `SetTeam(n)`, `SetInvincible(bool)`, `SetJetpackEnabled(bool)`, `SpawnObjectNearby(prefab, offset?)`), and query methods (`GetPosition()`, `IsInSeat()`). Mutators return `self` for chaining; queries return values. `Teleport` accepts either three positional numbers or a single `Vector3`. `SpawnObjectNearby` is sugar that reads the player position, applies an optional local offset, and routes through `ObjectSpawner:SpawnObject`. Unlike the other player mutators it returns the spawned object handle rather than the player, because the spawned object is almost always the value the caller actually needs next. Treat `SpawnObjectNearby` as a factory helper hung off the player rather than as a chainable player mutator; if the player itself is still needed, hold a local reference to the player before calling it. `Kick(reason)` accepts a reason string for the modder's convenience, but the host call `tm.players.Kick(playerId)` does not deliver the reason to the kicked player — the value is logged engine-side via `Logger:Info` and then discarded. Treat the reason as an audit-log message, not a user-facing notice. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
 
 Lookup methods on the service:
 
@@ -343,15 +400,15 @@ engine.Settings.WarnOnRawPrefabStrings = true
 A helper method exposes the resolver without committing to a spawn:
 
 ```lua
-local prefab, err = ObjectSpawner:ResolvePrefab("metal crate")
-if not prefab then
+local canonicalName, err = ObjectSpawner:ResolvePrefab("metal crate")
+if not canonicalName then
     Logger:Warn(err)
     return
 end
-ObjectSpawner:SpawnObject(prefab)
+ObjectSpawner:SpawnObject(canonicalName)
 ```
 
-`ResolvePrefab` returns the canonical name and an enum value when one exists, or `nil, err` on failure.
+In Phase 1, `ResolvePrefab` returns exactly two values: the canonical prefab name string on success, or `nil` plus an error string on failure. The LuaLS shape is `function ObjectSpawner:ResolvePrefab(name): (string?, string?)` — `canonicalName: string?` on success, `err: string?` on failure. The return shape is intentionally narrow — a single string is easy to pass straight back into `SpawnObject`, and the two-value contract avoids the trap of "second return value sometimes means enum, sometimes means error". A richer return value — a small descriptor table carrying canonical name, enum value, and display name — is reserved for a later phase, when the enum catalogue is broad enough for the extra fields to be worth the API surface.
 
 ### World
 
@@ -365,7 +422,14 @@ World:SetTimeOfDay(75)
 local mapName = World:GetMapName()
 ```
 
-`SetTimeOfDay` takes a value on the in-game slider scale — `0` to `100`, where `50` is midday. The dial wraps: `100` loops back to `0`, so values outside the range are accepted and reduced modulo `100`. The engine passes the value through to `tm.world.SetTimeOfDay` without unit conversion; if you want to think in 24-hour clock terms, write the conversion yourself (`hour / 24 * 100`) rather than expecting `World:SetTimeOfDayHour` sugar in Phase 1.
+`SetTimeOfDay` takes a value on the in-game slider scale — `0` to `100`, where `50` is midday. The dial wraps: `100` loops back to `0`, so values outside the range are accepted and reduced modulo `100`. Negative values wrap the same way:
+
+```lua
+World:SetTimeOfDay(-10)  -- becomes 90
+World:SetTimeOfDay(125)  -- becomes 25
+```
+
+The engine passes the final modulo'd value through to `tm.world.SetTimeOfDay` without unit conversion; if you want to think in 24-hour clock terms, write the conversion yourself (`hour / 24 * 100`) rather than expecting `World:SetTimeOfDayHour` sugar in Phase 1.
 
 The split between `World`, `ObjectSpawner`, and `Physics` is the engine's main correction to the host's `tm.physics` namespace, which bundles all three concerns. `World` is for state that is not about any particular object.
 
@@ -375,7 +439,9 @@ The split between `World`, `ObjectSpawner`, and `Physics` is the engine's main c
 
 ### Logger
 
-`Logger` is the engine's leveled logging service. It writes to a `logs.txt` file in the mod directory via `tm.os.WriteAllText_Dynamic` (or its append equivalent), never to the chat panel. The chat panel only renders six lines at a time, so using it for logs would burn the budget for any real player-visible message.
+`Logger` is the engine's leveled logging service. It writes to a `logs.txt` file in the mod directory, never to the chat panel. The chat panel only renders six lines at a time, so using it for logs would burn the budget for any real player-visible message.
+
+The file backing for Phase 1 is decided as follows. If the host's `tm.os` exposes an append-style write, the logger uses it directly and emits one line per call with negligible memory cost. If only `tm.os.WriteAllText_Dynamic` is available — which is the assumption Phase 1 plans for, because it is the documented host surface — the logger maintains an in-memory line buffer (`Logger._lines`) and rewrites `logs.txt` with `tm.os.WriteAllText_Dynamic(path, table.concat(self._lines, "\n"))` on each emission. The in-memory buffer means a long-running mod's log retention is bounded by available Lua memory and not by disk; mods that log heavily over many hours can exhaust memory if nothing trims the buffer. A future phase may add log rotation, a cap on retained lines, or a streaming sink. Phase 1 deliberately keeps the implementation simple and accepts the memory profile, because the alternative (a custom append shim per host quirk) is more code than it is worth before the host surface stabilises.
 
 ```lua
 Logger:Debug("scheduler tick")
@@ -398,6 +464,8 @@ local score = ModStorage:Get("highScore")
 
 `Get(key)` returns the stored value or `nil` if the key has not been written. `Set(key, value)` writes synchronously through to the mod-local storage file. Values are serialised through a small JSON-equivalent codec. The service documents honestly that durability is whatever the host filesystem gives — a corrupted save file or a crash during write can lose the last value. Mods that need transactional guarantees must implement their own write-ahead pattern on top.
 
+`Set` is synchronous in Phase 1 and performs a real file write on each call. Do not call it from every `OnUpdate` tick or from any other hot loop — the stutter from rewriting the storage file at frame rate will be visible. Cache frequently-changing values in memory and flush to `ModStorage` on a coarse interval (`UpdateService:Every(10, ...)` is a common pattern) or on shutdown. A future phase may add a debounced `Set` or an explicit `Flush` method; until then, batching is the caller's responsibility.
+
 ### UpdateService
 
 `UpdateService` exposes the engine's frame loop. Phase 1 ships a single signal:
@@ -419,21 +487,37 @@ end)
 
 The host backing is the Trailmakers global `update(dt)` callback that the host invokes every tick on every loaded mod. `UpdateService` installs a single `update` handler at engine boot, captures `dt`, and fans it out to `OnUpdate` listeners. There is no `tm.*` event for ticks — the global callback is the entire surface — so any frame-driven behaviour in the engine ultimately threads through here. This is also why `UpdateService` is a singleton inside the singleton engine: two engines registering competing `update` globals would be a host-level conflict.
 
-On top of `OnUpdate`, `UpdateService` ships a small set of time helpers for the common patterns. `UpdateService:After(seconds, fn)` runs `fn` once after at least `seconds` of accumulated tick time and returns a `Connection` that can be disconnected to cancel before fire. `UpdateService:Every(seconds, fn)` runs `fn` on a repeating interval driven by the same accumulator and returns a `Connection` that stops the interval on disconnect. Both helpers are sugar over `OnUpdate:Connect` with internal deadline tracking; they do not introduce new scheduling primitives. The Roblox-equivalent name `task.delay(seconds, fn)` is exposed as an alias for `UpdateService:After` so Roblox idioms work unmodified.
+Because `update` is a plain Lua global and may already be defined by user code, the engine has a concrete policy for the conflict case. At boot, `UpdateService` captures the existing `_G.update` (if any) into a local, and installs an `update` that calls the previous handler first and then pumps the engine:
+
+```lua
+local previousUpdate = _G.update
+
+_G.update = function(dt)
+    if previousUpdate then
+        previousUpdate(dt)
+    end
+    engine:_Update(dt)
+end
+```
+
+This means a user `update` defined **before** `LFTME.New()` keeps working — the engine simply wraps it. A user `update` defined **after** `LFTME.New()`, however, overwrites the engine's wrapper and breaks scheduling: `task.wait`, `task.spawn`, `UpdateService:After`, `UpdateService:Every`, and every signal that depends on `OnUpdate` will stop firing. The engine has no way to detect this after the fact without paying a per-tick cost it does not want to pay, so the rule is documented loudly: do not define a global `update` once the engine is constructed. Use `UpdateService.OnUpdate:Connect(...)` instead — it is the canonical surface for tick-driven behaviour and is immune to ordering hazards.
+
+On top of `OnUpdate`, `UpdateService` ships a small set of time helpers for the common patterns. `UpdateService:After(seconds, fn)` runs `fn` once after at least `seconds` of accumulated tick time and returns a `TaskHandle` that can be cancelled before fire. `UpdateService:Every(seconds, fn)` runs `fn` on a repeating interval driven by the same accumulator and returns a `TaskHandle` that stops the interval when cancelled. Both helpers are sugar over `OnUpdate:Connect` with internal deadline tracking; they do not introduce new scheduling primitives. They return `TaskHandle` rather than `Connection` because the value handed back is a scheduled piece of work, not a subscription to a signal — keeping the two primitives semantically distinct prevents `Connection` from drifting into a catch-all. The Roblox-equivalent name `task.delay(seconds, fn)` is exposed as an alias for `UpdateService:After` so Roblox idioms work unmodified; it also returns a `TaskHandle`.
 
 ```lua
 -- one-shot, cancellable
-local conn = UpdateService:After(5, function()
+local handle = UpdateService:After(5, function()
     Logger:Info("five seconds elapsed")
 end)
--- conn:Disconnect()  -- cancels before fire
+-- handle:Cancel()  -- cancels before fire
 
 -- repeating interval
-UpdateService:Every(1, function()
+local ticker = UpdateService:Every(1, function()
     Logger:Debug("tick")
 end)
+-- ticker:Cancel()  -- stops the interval
 
--- Roblox alias
+-- Roblox alias, also returns a TaskHandle
 task.delay(2, function() Logger:Info("two seconds elapsed") end)
 ```
 
@@ -461,6 +545,29 @@ Returned by `Signal:Connect` and `Signal:Once`. Surface:
 - `Connection.Connected` — boolean, true until `Disconnect` is called.
 - `Connection:Disconnect()` — unregisters the handler. Idempotent. Does not yield.
 
+### TaskHandle
+
+`TaskHandle` is the engine's primitive for scheduled or background work — anything produced by `task.spawn`, `task.delay`, `UpdateService:After`, or `UpdateService:Every`. It exists to keep "a signal subscription" (`Connection`) and "a piece of scheduled work" (`TaskHandle`) semantically distinct, so each has one obvious cleanup verb and `TaskManager` can route either correctly. Public surface:
+
+- `TaskHandle.Cancelled` — boolean, false until `Cancel` is called, true afterwards.
+- `TaskHandle:Cancel()` — cancels the scheduled work. For `task.spawn` and `task.delay`, this prevents future resumes of the underlying coroutine. For `UpdateService:After`, this prevents the deferred `fn` from firing. For `UpdateService:Every`, this stops the repeating interval. Idempotent; calling `Cancel` on an already-cancelled handle is a no-op. Does not yield.
+
+```lua
+local handle = task.delay(5, function()
+    Logger:Info("five seconds in")
+end)
+
+if shouldAbort then
+    handle:Cancel()
+end
+
+if handle.Cancelled then
+    Logger:Debug("deferred task aborted")
+end
+```
+
+`TaskManager:Add(taskHandle)` registers a handle and calls `:Cancel()` on it during cleanup, the same way it calls `:Disconnect()` on a `Connection` or `:Destroy()` on an engine object.
+
 ### TaskManager
 
 `TaskManager` is the engine's general cleanup primitive. It tracks heterogeneous "things that need releasing" and releases them all in one call. The earlier shape from Roblox is called `Maid`; the LFTME name is `TaskManager` because outside Roblox `Maid` is opaque.
@@ -477,19 +584,22 @@ tasks:Destroy()
 Public surface:
 
 - `TaskManager.new() -> TaskManager` — constructor.
-- `TaskManager:Add(task) -> token` — registers a task. Returns an opaque token usable with `Remove`.
-- `TaskManager:Remove(token)` — releases and removes a specific task without releasing the others.
+- `TaskManager:Add(task) -> token` — registers a task. Returns an opaque token usable with `Remove` and `CleanupTask`.
+- `TaskManager:Remove(token)` — forgets the task without releasing it. The manager drops its reference; the caller takes ownership of cleanup from that point on.
+- `TaskManager:CleanupTask(token)` — releases the specific task and removes it from the manager. Other tasks are untouched.
 - `TaskManager:Cleanup()` — releases every registered task in reverse insertion order. The manager is reusable after `Cleanup`.
 - `TaskManager:Destroy()` — calls `Cleanup` and marks the manager unusable; further calls error.
 
 The task argument can be any of:
 
 - a `Connection` — `:Disconnect()` is called
+- a `TaskHandle` returned by `task.spawn`, `task.delay`, `UpdateService:After`, or `UpdateService:Every` — `:Cancel()` is called
 - an engine object with a `:Destroy()` method (e.g. `SpawnedObject`) — `:Destroy()` is called
 - a plain function — the function is called with no arguments
-- a coroutine handle — cancelled if the host supports cancellation, otherwise abandoned
 
-Per-player `TaskManager` instances are created automatically by `Players` when a player joins and reachable at `player.TaskManager`. They are destroyed automatically during `PlayerLeftServer` dispatch, after user callbacks have had their chance to add last-minute tasks. The common pattern is:
+Phase 1 deliberately does not accept raw `coroutine.create` / `coroutine.wrap` handles. Plain Lua coroutines cannot be forcibly cancelled in a safe, host-portable way, and silently abandoning them leaves yielded frames and retained closures behind. Code that wants its background work to be cancellable through a `TaskManager` must go through `task.spawn` (or one of the other helpers above) so it gets back a real `TaskHandle`.
+
+Per-player `TaskManager` instances are created automatically by `Players` when a player joins and reachable at `player.TaskManager`. The lifecycle around departure is precise: during `PlayerLeftServer` dispatch, `player.TaskManager` is still fully accessible — handlers may read it, add last-minute tasks, or invoke methods on it. After every `PlayerLeftServer` handler has finished, the engine calls `player.TaskManager:Destroy()`, which cleans up everything registered and marks the manager unusable. Last-minute additions made during the dispatch are released by that same `Destroy()` call, so they are useful for guaranteed-final cleanup but not for work that needs to outlive the dispatch. The common pattern is:
 
 ```lua
 Players.PlayerJoinedServer:Connect(function(player)
@@ -513,7 +623,7 @@ local pattern = Enum.SpawnPattern.Circle
 local crate = Enum.Block.MetalCrate
 ```
 
-Each enum member is a singleton table with `Name`, `Value`, and an `EnumType` back-reference. Equality is identity (`Enum.Block.MetalCrate == Enum.Block.MetalCrate`). Stringification returns the fully qualified name (`Enum.Block.MetalCrate`). Phase 1 ships `Enum.Block.*`, `Enum.SpawnPattern.*`, and the small enums needed by ChatService and World.
+Each enum member is a singleton table with `Name`, `Value`, and an `EnumType` back-reference. Equality is identity (`Enum.Block.MetalCrate == Enum.Block.MetalCrate`). Stringification returns the fully qualified name (`Enum.Block.MetalCrate`). Phase 1 ships the enum infrastructure — the `Enum.<Category>.<Member>` access pattern, identity equality, and stringification — together with `Enum.SpawnPattern.*` and the small enums needed by ChatService and World. The `Enum.Block` table exists and the access pattern works, but Phase 1 does not ship the full block catalogue; only the members required by the examples and tests are populated. Mods that want to refer to a block whose enum member is not yet shipped should pass the canonical or fuzzy string instead — the resolver in `ObjectSpawner` handles both.
 
 ## 8. The task library
 
@@ -530,11 +640,24 @@ end)
 
 `task.wait(seconds)` yields the current coroutine via `coroutine.yield` and schedules a resume after at least `seconds` seconds of accumulated `UpdateService.OnUpdate` deltas. The exact resume timing depends on host tick rate; the engine documents that the precision is not 60 Hz and not tied to rendering. The engine never busy-waits.
 
-`task.spawn(fn, ...)` creates a new scheduler-managed coroutine, resumes it immediately with the trailing arguments, and returns. The caller does not yield. If `fn` errors, the error is routed to `Logger:Error` rather than escaping silently.
+`task.spawn(fn, ...)` creates a new scheduler-managed coroutine, resumes it immediately with the trailing arguments, and returns a `TaskHandle`. The caller does not yield. If `fn` errors, the error is routed to `Logger:Error` rather than escaping silently. The returned handle exposes `:Cancel()` to stop the coroutine at its next yield point and a `Cancelled` boolean for inspection. Returning a handle is an LFTME extension over Roblox's `task.spawn`, which returns nothing useful; the extra surface is what makes `TaskManager` cleanup work cleanly for background tasks.
+
+```lua
+local handle = task.spawn(function()
+    task.wait(10)
+    Logger:Info("done")
+end)
+
+-- later:
+handle:Cancel()
+if handle.Cancelled then
+    Logger:Info("cancelled the long wait")
+end
+```
 
 Both functions integrate with the engine's `pcall` isolation for signal callbacks. A task that yields inside a callback works correctly because the engine resumes it from `UpdateService.OnUpdate` rather than from the signal dispatch.
 
-Calling `task.wait` from a coroutine that the engine did not create — for example, a raw `coroutine.wrap` from user code — is the one place the engine actively enforces yield rules, because the wait would never resume otherwise. The call errors with the standard error format pointing at the `task.wait` site.
+Calling `task.wait` or `Signal:Wait` from a coroutine that the engine did not create — for example, a raw `coroutine.wrap` from user code — is the one place the engine actively enforces yield rules, because the yield would never be resumed otherwise. The call errors with the runtime-failure template pointing at the `task.wait` or `Signal:Wait` site (see section 4 for the format and the exact `Signal:Wait` example).
 
 ## 9. Patterns library
 
@@ -663,10 +786,16 @@ end
 
 ### Error message format
 
-Every error message — whether thrown for programmer errors or returned as the `err` half of `nil, err` — follows the same template:
+Every error message — whether thrown for programmer errors or returned as the `err` half of `nil, err` — follows one of the two templates introduced in section 4. The type-error template is used for parameter typechecks:
 
 ```text
 <ClassOrService>:<Method>(<file>:<line>) expected <expectedType> for parameter "<paramName>", got <actualType> <actualValue>
+```
+
+The runtime-failure template is used for state-dependent failures (prefab resolution, missing players, double-construction, etc.):
+
+```text
+<ClassOrService>:<Method>(<file>:<line>) <message>
 ```
 
 When formatting `<actualValue>`:
@@ -726,7 +855,7 @@ The Phase 1 deliverables are:
 - The standard error message formatter in `util/Typecheck.lua` and its use everywhere the engine raises or returns errors.
 - The single-file bundle `dist/LFTME.lua` and the IDE definition stub `dist/LFTME.d.lua`.
 
-Reserved for later phases: `Physics` raycasts and overlaps (waiting on host support), the broader `Enum.Block.*` catalogue, additional spawn patterns, a streaming `Logger` sink, and any pre-physics or post-physics signal on `UpdateService` that the host might eventually make distinguishable.
+Reserved for later phases: `Physics` raycasts and overlaps (waiting on host support), the broader `Enum.Block.*` catalogue beyond the members required by Phase 1 examples and tests, a descriptor-table return from `ObjectSpawner:ResolvePrefab` carrying canonical name, enum value, and display name, additional spawn patterns, a streaming `Logger` sink, and any pre-physics or post-physics signal on `UpdateService` that the host might eventually make distinguishable.
 
 ## Appendix A: Worked example — a small mod end to end
 
@@ -826,6 +955,6 @@ If the method is a signal handler entry point (a `Connect` callback the user sup
 
 If the method touches the host `tm.*` API, it does so through the appropriate service's private wrapper rather than reaching out directly. The boundary between engine and host is one place in the source per host call, which makes future host changes a localised edit.
 
-Tests live next to the source file as `<ClassName>_test.lua`. The test suite exercises the happy path, every documented error path with its exact error string, and the yield/no-yield behaviour where it differs from the obvious default.
+Tests live next to the source file as `<ClassName>_test.lua`. The test suite exercises the happy path, every documented error path with its exact error string, and the yield/no-yield behaviour where it differs from the obvious default. When asserting against error strings, tests should match the message body exactly but allow the file and line portion of the prefix to vary, unless the test injects a stable callsite (for example by calling through a fixture function at a known location). Pinning the literal `<file>:<line>` of every error in tests makes the suite brittle to unrelated edits in the file under test and is not the intent of the standard format; the standard format exists so users see useful callsites, not so tests can hash them.
 
 The change ships with a doc update either in this design document (for new public conventions) or in the per-service section that owns the method (for a new method on an existing service). A pull request that adds a method without a doc update does not pass review.
