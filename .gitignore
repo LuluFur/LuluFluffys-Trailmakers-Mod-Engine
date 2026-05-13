@@ -37,3 +37,7 @@ venv/
 .cache/
 .tmp/
 coverage/
+
+# Local planning / design notes — never tracked
+.planning/
+planning/
