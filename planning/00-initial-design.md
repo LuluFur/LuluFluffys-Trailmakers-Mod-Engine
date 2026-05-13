@@ -38,4 +38,4 @@ Phase 1 lands the core: `LFTME.New()` with `:GetService`, the `Signal` and `Conn
 
 ## Logger
 
-The Logger service writes to a  file in the mod directory via  (or its append equivalent). It never writes to chat, because the chat panel only renders six lines at once and logs would immediately burn that budget for any real player-visible message. The Logger exposes leveled methods (, , , ) and is decoupled from , which the host treats as console-only; Logger may additionally call  for parity but the file is the source of truth.
+The Logger service writes to a `logs.txt` file in the mod directory via `tm.os.WriteAllText_Dynamic` (or its append equivalent). It never writes to chat, because the chat panel only renders six lines at once and logs would immediately burn that budget for any real player-visible message. The Logger exposes leveled methods (`Logger:Debug`, `Logger:Info`, `Logger:Warn`, `Logger:Error`) and is decoupled from `tm.os.Log`, which the host treats as console-only; Logger may additionally call `tm.os.Log` for parity but the file is the source of truth.
