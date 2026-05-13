@@ -1,8 +1,9 @@
-# scratch-2026-05-13
+# LuluFluffy's Trailmakers Mod Engine
 
 ## Description
-Scratch project scaffolded via `/new-project` without a specified name. Repurpose by
-renaming the repo and updating this file when an actual purpose is assigned.
+Modding engine / framework for Trailmakers. Scope TBD — to be expanded as design
+decisions are made (engine architecture, mod loading model, target Trailmakers
+runtime, scripting surface, etc.).
 
 ## Stack
 TBD
@@ -11,3 +12,7 @@ TBD
 - Inherits autonomous-agent directives from root `C:\Users\Lewis\OneDrive\Desktop\AI-Automation\CLAUDE.md`
 - Feature branches only; no direct commits to `main`
 - Conventional commits: `type(scope): description`
+
+## Notes
+- Repo slug uses hyphens (no apostrophe) because GitHub repo names disallow `'`:
+  `LuluFluffys-Trailmakers-Mod-Engine`. Display name retains the apostrophe.
