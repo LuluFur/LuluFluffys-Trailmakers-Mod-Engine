@@ -244,7 +244,7 @@ end)
 
 The event names are deliberately Trailmakers-clear rather than strict Roblox tense (`PlayerAdded`/`PlayerRemoving`). The Trailmakers session model is "a server with players joining and leaving", and the names should say exactly that. `PlayerLeftServer` fires after the host reports the disconnect, but the wrapped `Player` object is still queryable for `Name`, `Id`, and any engine-cached state for the duration of the dispatch. After the dispatch returns, the engine drops its references to that player.
 
-Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(x, y, z)` or `Teleport(Vector3)`, `Kick(reason)`, `Kill()`, `Eject()`, `SetTeam(n)`, `SetInvincible(bool)`, `SetJetpackEnabled(bool)`, `SpawnObjectNearby(prefab, offset?)`), and query methods (`GetPosition()`, `IsInSeat()`). Mutators return `self` for chaining; queries return values. `Teleport` accepts either three positional numbers or a single `Vector3`. `SpawnObjectNearby` is sugar that reads the player position, applies an optional local offset, and routes through `ObjectSpawner:SpawnObject`; it returns `self` (the player) for continued chaining — the spawned object handle is recoverable through `ObjectSpawner:Find` if needed. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
+Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(x, y, z)` or `Teleport(Vector3)`, `Kick(reason)`, `Kill()`, `Eject()`, `SetTeam(n)`, `SetInvincible(bool)`, `SetJetpackEnabled(bool)`, `SpawnObjectNearby(prefab, offset?)`), and query methods (`GetPosition()`, `IsInSeat()`). Mutators return `self` for chaining; queries return values. `Teleport` accepts either three positional numbers or a single `Vector3`. `SpawnObjectNearby` is sugar that reads the player position, applies an optional local offset, and routes through `ObjectSpawner:SpawnObject`; it returns `self` (the player) for continued chaining — the spawned object handle is recoverable through `ObjectSpawner:Find` if needed. `Kick(reason)` accepts a reason string for the modder's convenience, but the host call `tm.players.Kick(playerId)` does not deliver the reason to the kicked player — the value is logged engine-side via `Logger:Info` and then discarded. Treat the reason as an audit-log message, not a user-facing notice. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
 
 Lookup methods on the service:
 
@@ -361,9 +361,11 @@ ObjectSpawner:SpawnObject(prefab)
 local World = engine:GetService("World")
 World:SetGravity(Vector3.new(0, -20, 0))
 World:SetTimeScale(0.5)
-World:SetTimeOfDay(18.0)
+World:SetTimeOfDay(75)
 local mapName = World:GetMapName()
 ```
+
+`SetTimeOfDay` takes a value on the in-game slider scale — `0` to `100`, where `50` is midday. The dial wraps: `100` loops back to `0`, so values outside the range are accepted and reduced modulo `100`. The engine passes the value through to `tm.world.SetTimeOfDay` without unit conversion; if you want to think in 24-hour clock terms, write the conversion yourself (`hour / 24 * 100`) rather than expecting `World:SetTimeOfDayHour` sugar in Phase 1.
 
 The split between `World`, `ObjectSpawner`, and `Physics` is the engine's main correction to the host's `tm.physics` namespace, which bundles all three concerns. `World` is for state that is not about any particular object.
 
@@ -414,6 +416,28 @@ end)
 - It is not guaranteed to be pre-physics or post-physics unless the host exposes that distinction. Until it does, there is no `Stepped`.
 
 `OnUpdate` is the canonical driver for `task.wait`, `task.spawn`, deferred callbacks, and any internal scheduling. The name is `UpdateService.OnUpdate` rather than `RunService.Heartbeat` because honesty about timing semantics beats Roblox-shaped familiarity in this one case.
+
+The host backing is the Trailmakers global `update(dt)` callback that the host invokes every tick on every loaded mod. `UpdateService` installs a single `update` handler at engine boot, captures `dt`, and fans it out to `OnUpdate` listeners. There is no `tm.*` event for ticks — the global callback is the entire surface — so any frame-driven behaviour in the engine ultimately threads through here. This is also why `UpdateService` is a singleton inside the singleton engine: two engines registering competing `update` globals would be a host-level conflict.
+
+On top of `OnUpdate`, `UpdateService` ships a small set of time helpers for the common patterns. `UpdateService:After(seconds, fn)` runs `fn` once after at least `seconds` of accumulated tick time and returns a `Connection` that can be disconnected to cancel before fire. `UpdateService:Every(seconds, fn)` runs `fn` on a repeating interval driven by the same accumulator and returns a `Connection` that stops the interval on disconnect. Both helpers are sugar over `OnUpdate:Connect` with internal deadline tracking; they do not introduce new scheduling primitives. The Roblox-equivalent name `task.delay(seconds, fn)` is exposed as an alias for `UpdateService:After` so Roblox idioms work unmodified.
+
+```lua
+-- one-shot, cancellable
+local conn = UpdateService:After(5, function()
+    Logger:Info("five seconds elapsed")
+end)
+-- conn:Disconnect()  -- cancels before fire
+
+-- repeating interval
+UpdateService:Every(1, function()
+    Logger:Debug("tick")
+end)
+
+-- Roblox alias
+task.delay(2, function() Logger:Info("two seconds elapsed") end)
+```
+
+The accumulator semantics matter: if the host is paused or slowed (low tick rate, the player tabbed out, debug freeze), `After(5, fn)` does not fire after five wall-clock seconds — it fires after five seconds of accumulated `OnUpdate` deltas. This is the same honesty principle that names the signal `OnUpdate` rather than `Heartbeat`.
 
 ## 7. Core primitives
 
@@ -493,7 +517,7 @@ Each enum member is a singleton table with `Name`, `Value`, and an `EnumType` ba
 
 ## 8. The task library
 
-The engine ports the two task primitives that are core Roblox idiom: `task.wait` and `task.spawn`. Both are reached as `LFTME.task.wait` and `LFTME.task.spawn`, with the canonical local alias being `local task = LFTME.task`.
+The engine ports the core Roblox task primitives: `task.wait`, `task.spawn`, and `task.delay`. All three are reached as `LFTME.task.*`, with the canonical local alias being `local task = LFTME.task`. `task.delay(seconds, fn)` is an alias for `UpdateService:After(seconds, fn)`; see section 6 for the accumulator semantics.
 
 ```lua
 local task = LFTME.task
@@ -689,7 +713,7 @@ The Phase 1 deliverables are:
 - `Signal` and `Connection` classes with `Connect`, `Once`, `Wait`, `Disconnect`, and `pcall` isolation of user callbacks.
 - `TaskManager` with `Add`, `Remove`, `Cleanup`, `Destroy`. Per-player `player.TaskManager` created and destroyed automatically by `Players`.
 - The `task` library: `task.wait(seconds)` and `task.spawn(fn, ...)`. Both driven by `UpdateService.OnUpdate`.
-- `UpdateService` exposing `OnUpdate` with weaker-than-Roblox guarantees documented.
+- `UpdateService` exposing `OnUpdate` (driven by the host global `update(dt)` callback) plus the time helpers `After`, `Every`, and the `task.delay` alias. Weaker-than-Roblox guarantees documented.
 - The `Enum` skeleton with the categories needed by Phase 1 services (`Enum.SpawnPattern`, the small enums for chat and world).
 - `Vector3` and `Color3` data types, with the operations listed in section 5.
 - `MarkupText` chainable builder reachable as `LuluFluffysTrailmakersModEngine.MarkupText`.
