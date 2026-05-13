@@ -93,7 +93,7 @@ A handful of patterns recur across every service. Learning them once is enough t
 
 Any method that configures an object or action returns `self` so the next configuration call can be appended with a dot. Mutators chain, queries do not, constructors do not. The full rule:
 
-- Mutators (setters, configurators, state-changing actions like `Teleport`, `Heal`, `Kick`) return `self`.
+- Mutators (setters, configurators, state-changing actions like `Teleport`, `Kick`, `Eject`) return `self`.
 - Queries (`GetPosition`, `GetPlayers`, `FindByName`, `HasFlag`, `IsAlive`) return the requested value.
 - Constructors (`.new`) return the freshly built instance, not `self` from a chain.
 
@@ -112,7 +112,7 @@ Chat:BroadcastToAll():Header("Warning"):Body("Server restarting"):Duration(10)
 Player mutator chains work too:
 
 ```lua
-Players:FindByName("Player123"):Teleport(v3):Heal(100)
+Players:FindByName("Player123"):Teleport(0, 310, 0):Eject():SpawnObjectNearby("PFB_Metal_Crate")
 ```
 
 The terminal call returns the configured object, so the chain ends naturally when the user stops typing dots. Single-call uses still work — `ObjectSpawner:SpawnObject("PFB_Metal_Crate")` is a valid expression that spawns at the default position and returns a `SpawnedObject`. Two-or-fewer positional arguments stay positional and unchained when that reads more naturally; chained setters are reserved for cases with a real configuration surface.
@@ -244,7 +244,7 @@ end)
 
 The event names are deliberately Trailmakers-clear rather than strict Roblox tense (`PlayerAdded`/`PlayerRemoving`). The Trailmakers session model is "a server with players joining and leaving", and the names should say exactly that. `PlayerLeftServer` fires after the host reports the disconnect, but the wrapped `Player` object is still queryable for `Name`, `Id`, and any engine-cached state for the duration of the dispatch. After the dispatch returns, the engine drops its references to that player.
 
-Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(position)`, `Heal(amount)`, `Kick(reason)`), and query methods (`GetPosition()`, `IsAlive()`). Mutators return `self` for chaining; queries return values. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
+Each `Player` object exposes `Name`, `Id`, mutator methods (`Teleport(x, y, z)` or `Teleport(Vector3)`, `Kick(reason)`, `Kill()`, `Eject()`, `SetTeam(n)`, `SetInvincible(bool)`, `SetJetpackEnabled(bool)`, `SpawnObjectNearby(prefab, offset?)`), and query methods (`GetPosition()`, `IsInSeat()`). Mutators return `self` for chaining; queries return values. `Teleport` accepts either three positional numbers or a single `Vector3`. `SpawnObjectNearby` is sugar that reads the player position, applies an optional local offset, and routes through `ObjectSpawner:SpawnObject`; it returns `self` (the player) for continued chaining — the spawned object handle is recoverable through `ObjectSpawner:Find` if needed. Each `Player` also owns a `TaskManager` instance at `player.TaskManager`, automatically created by `Players` when the player joins and automatically destroyed when the player leaves. Section 7 covers `TaskManager` in detail.
 
 Lookup methods on the service:
 
@@ -605,7 +605,7 @@ There is no Instance tree, no `workspace`, no `Parent` assignment. The Trailmake
 
 There is no `RemoteEvent`, `RemoteFunction`, or any other client/server boundary primitive. Trailmakers does not expose a client/server split to mods — the mod runs in one place. Pretending otherwise would invite security and consistency assumptions the engine cannot deliver on.
 
-There is no `Humanoid` and no `player.Character`. A Trailmakers player is a controller of vehicles, not an avatar with a body, animations, health pool, and rig. The `Player` object exposes the controls and queries that actually make sense in Trailmakers (`Teleport`, `GetPosition`, `Kick`, `Heal` where the host supports it) and does not pretend to have a character.
+There is no `Humanoid` and no `player.Character`. A Trailmakers player is a controller of vehicles, not an avatar with a body, animations, health pool, and rig. The `Player` object exposes the controls and queries that actually make sense in Trailmakers (`Teleport`, `GetPosition`, `Kick`, `Kill`, `Eject`, `SetInvincible`, `SetJetpackEnabled`) and does not pretend to have a character.
 
 The persistence service is called `ModStorage`, never `DataStoreService`. The Roblox name carries strong durability and consistency guarantees that the local-file backing on a player's machine cannot honour. Naming it `ModStorage` keeps expectations honest.
 
@@ -693,7 +693,7 @@ The Phase 1 deliverables are:
 - The `Enum` skeleton with the categories needed by Phase 1 services (`Enum.SpawnPattern`, the small enums for chat and world).
 - `Vector3` and `Color3` data types, with the operations listed in section 5.
 - `MarkupText` chainable builder reachable as `LuluFluffysTrailmakersModEngine.MarkupText`.
-- `Players` service with `PlayerJoinedServer`, `PlayerLeftServer`, `GetPlayers`, `FindByName`, `FindById`, `Iterate`. `Player` objects with `Name`, `Id`, `TaskManager`, `Teleport`, `Heal`, `Kick`, `GetPosition`, `IsAlive`.
+- `Players` service with `PlayerJoinedServer`, `PlayerLeftServer`, `GetPlayers`, `FindByName`, `FindById`, `Iterate`. `Player` objects with `Name`, `Id`, `TaskManager`, `Teleport`, `Kick`, `Kill`, `Eject`, `SetTeam`, `SetInvincible`, `SetJetpackEnabled`, `SpawnObjectNearby`, `GetPosition`, `IsInSeat`.
 - `Chat` service with `SendMessageTo`, `BroadcastToAll` (positional and chainable builder forms), and the `MessageReceived` signal. Echo suppression hidden inside the wrapper. Six-line chat panel cap documented. HTML-style tags accepted only on intrusive popups.
 - `ObjectSpawner` service with `SpawnObject`, `SpawnGroup`, `ResolvePrefab`, and the fuzzy resolution order from section 6. Built-in patterns: `Circle`, `Ring`, `Grid`, `Cube`, `Sphere`, `Line`, `Wall`. Custom pattern registration via `LuluFluffysTrailmakersModEngine.Patterns:Register`. Optional `engine.Settings.WarnOnRawPrefabStrings`.
 - `World` service with gravity, time scale, time of day, wind, and map name accessors.
