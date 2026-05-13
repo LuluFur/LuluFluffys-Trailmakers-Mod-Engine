@@ -6,7 +6,13 @@ LuluFluffy's Trailmakers Mod Engine (LFTME) is a proxy / abstraction layer that 
 
 ## Public surface — entry point
 
-The engine is instance-based. A user mod boots with `local myMod = LuluFluffysTrailmakersModEngine.New()` (canonical) or `local myMod = LFTME.New()` (short alias). Both names point at the same constructor. From there, subsystems are obtained via `myMod:GetService("ServiceName")` in Roblox style — `GetService` is the canonical lookup, with very few lowercase shortcuts allowed for hot subsystems if at all.
+The engine is instance-based. A user mod boots with the canonical constructor:
+
+```lua
+local engine = LuluFluffysTrailmakersModEngine.New()
+```
+
+or with the short alias `local engine = LFTME.New()`. Both names point at the same constructor. From there, subsystems are obtained via `engine:GetService("ServiceName")` in Roblox style — `GetService` is the canonical lookup, with very few lowercase shortcuts allowed for hot subsystems if at all.
 
 ## Style — Roblox-like
 
@@ -22,7 +28,11 @@ The chat surface has two methods, mapped to two distinct host UI elements. `Chat
 
 ## Boundary rule — service vs player object
 
-Methods on a service (`Chat`, `Physics`, `Players`, `ModStorage`, `Logger`) represent the engine acting on behalf of the user. Methods on a player object (`player:Kick`, `player:Teleport`, `player:GetPosition`) represent the player as the actor or the data source. This split avoids the awkward reading of `player:SendChatMessage(...)`, which sounds like the player is doing the chatting. Inbound events also live on the relevant service, not on the player — `Chat.MessageReceived:Connect(function(player, msg) ... end)`.
+Methods on a service (`Chat`, `Physics`, `Players`, `ModStorage`, `Logger`) represent the engine acting on behalf of the user. Methods on a player object (`player:Kick`, `player:Teleport`, `player:GetPosition`) represent the player as the actor or the data source. This split avoids the awkward reading of `player:SendChatMessage(...)`, which sounds like the player is doing the chatting. Inbound events also live on the relevant service, not on the player:
+
+```lua
+Chat.MessageReceived:Connect(function(player, msg) ... end)
+```
 
 ## Things we deliberately do not port from Roblox
 
@@ -45,14 +55,44 @@ The Logger service writes to a `logs.txt` file in the mod directory via `tm.os.W
 Intrusive popups support a subset of HTML-style formatting tags inside both `header` and `message` strings. Common tags: `<b>` or `<strong>` (bold), `<i>` or `<em>` (italics), `<mark>` (highlight), `<small>` (smaller text). Tags are paired — opening and closing required, e.g. `<b>Bold Text</b>`. The engine passes these through unmodified so callers retain full control. Chat lines (`Chat:SendMessageTo`) do not support these tags — the in-game chat panel renders plain text only, so the engine will document that formatting is intrusive-only and will not silently strip or convert tags between surfaces.
 ## MarkupText helper
 
-Two valid styles for intrusive message formatting. Raw HTML-style tags are always accepted: `Chat:BroadcastToAll("Alert", "<b>Server</b> restarting")` works and the engine does nothing clever to it. For ergonomic and discoverable construction, the engine also exposes `myMod.MarkupText`, a chainable builder. `MarkupText.new("Hello Everyone"):Bold():Italic()` wraps the inner text in tags from the inside out, producing `<i><b>Hello Everyone</b></i>`, and stringifies via `__tostring` so it can be passed directly to any service that accepts a string. Supported chained methods mirror the supported tags: `:Bold()` / `:Strong()`, `:Italic()` / `:Em()`, `:Mark()`, `:Small()`. Calls compose in order — the first method becomes the innermost tag. The builder is pure and immutable; each chained call returns a new MarkupText so partially-built fragments can be reused. Raw strings and MarkupText instances are interchangeable wherever an intrusive message accepts text.
+Two valid styles for intrusive message formatting. Raw HTML-style tags are always accepted:
+
+```lua
+Chat:BroadcastToAll("Alert", "<b>Server</b> restarting")
+```
+
+works and the engine does nothing clever to it. For ergonomic and discoverable construction, the engine also exposes `LuluFluffysTrailmakersModEngine.MarkupText`, a chainable builder. The pattern:
+
+```lua
+LuluFluffysTrailmakersModEngine.MarkupText.new("Hello Everyone"):Bold():Italic()
+```
+
+wraps the inner text in tags from the inside out, producing `<i><b>Hello Everyone</b></i>`, and stringifies via `__tostring` so it can be passed directly to any service that accepts a string. Supported chained methods mirror the supported tags: `:Bold()` / `:Strong()`, `:Italic()` / `:Em()`, `:Mark()`, `:Small()`. Calls compose in order — the first method becomes the innermost tag. The builder is pure and immutable; each chained call returns a new MarkupText so partially-built fragments can be reused. Raw strings and MarkupText instances are interchangeable wherever an intrusive message accepts text.
 ## Chainable builders instead of option tables
 
-Engine-wide convention: any method that configures an object or action uses chained setters that return `self`, not an options table. Example: `Physics:SpawnObject("PFB_Metal_Crate"):Position(0, 310, 0):Scale(1, 1, 1):Rotation(0, 45, 0)`. The terminal call returns the configured object (the SpawnedObject in this case), so the chain ends naturally when the user stops typing dots. Single-call uses still work: `Physics:SpawnObject("PFB_Metal_Crate")` is valid and spawns at the default position. Two-or-fewer args stay positional and unchained when that reads more naturally; chained setters are reserved for cases where there is a real configuration surface with multiple optional knobs.
+Engine-wide convention: any method that configures an object or action uses chained setters that return `self`, not an options table. Example:
+
+```lua
+Physics:SpawnObject("PFB_Metal_Crate"):Position(0, 310, 0):Scale(1, 1, 1):Rotation(0, 45, 0)
+```
+
+The terminal call returns the configured object (the SpawnedObject in this case), so the chain ends naturally when the user stops typing dots. Single-call uses still work: `Physics:SpawnObject("PFB_Metal_Crate")` is valid and spawns at the default position. Two-or-fewer args stay positional and unchained when that reads more naturally; chained setters are reserved for cases where there is a real configuration surface with multiple optional knobs.
 
 Spawn semantics are eager: the host call (`tm.physics.SpawnObject`) fires on the first `SpawnObject` call and the chain mutates the live object in place. The engine guarantees that all chained setters run before the next physics step, so the object never visibly appears at the origin then teleports — there is no "pop" between the initial spawn and the final configuration. This is a documented guarantee, not best-effort.
 
-The same pattern applies wherever it reads cleanly. `Chat:BroadcastToAll("Alert")` returns a popup handle with `:Header(text)`, `:Duration(seconds)`, `:Body(text)` chainable setters so `Chat:BroadcastToAll():Header("Warning"):Body("Server restarting"):Duration(10)` works. Player mutator chains read well too: `Players:FindByName("Lewis"):Teleport(v3):Heal(100)`. Methods that return data (`player:GetPosition()`, `Players:GetPlayers()`) obviously do not chain — the return value is the data, not `self`.
+The same pattern applies wherever it reads cleanly. `Chat:BroadcastToAll("Alert")` returns a popup handle with `:Header(text)`, `:Duration(seconds)`, `:Body(text)` chainable setters so the call:
+
+```lua
+Chat:BroadcastToAll():Header("Warning"):Body("Server restarting"):Duration(10)
+```
+
+works. Player mutator chains read well too:
+
+```lua
+Players:FindByName("Lewis"):Teleport(v3):Heal(100)
+```
+
+Methods that return data (`player:GetPosition()`, `Players:GetPlayers()`) obviously do not chain — the return value is the data, not `self`.
 
 Three rules govern when a method returns `self` versus a value. First, mutators (setters, configurators, state-changing actions like Teleport / Heal / Kick) return `self` to enable chaining. Second, queries (getters, lookups, predicates) return the requested value. Third, constructors (`.new`) return the new instance, never `self` from a chain. The naming convention reinforces this: setter-style verbs (`Position`, `Scale`, `Header`) chain; query-style verbs (`Get*`, `Find*`, `Has*`, `Is*`) do not.
 ## ObjectSpawner, World, Physics — splitting tm.physics
@@ -65,9 +105,33 @@ The host `tm.physics` namespace bundles three unrelated concerns: object spawnin
 
 ## Built-in spawn patterns
 
-Patterns are chainable methods on SpawnedGroup. Built-ins ship with the engine: `:Circle(radius, count)` lays members around a horizontal circle; `:Ring(radius, count, thickness)` is a circle with optional radial jitter; `:Grid(rows, cols, spacing)` lays a 2D grid; `:Cube(side, count)` and `:Sphere(radius, count)` fill volumes; `:Line(length, count)` runs a straight line along the local X axis; `:Wall(width, height, spacing)` tiles a vertical plane. Each pattern places members and returns the group, so patterns themselves chain — `ObjectSpawner:SpawnGroup("PFB_Wall"):Wall(10, 4):Position(0, 0, 50):Rotation(0, 90, 0)` builds a wall, parks it, faces it. Order matters: pattern methods compute member offsets at call time relative to the current group transform, so later `Position`/`Rotation` moves the whole assembly. Patterns are idempotent over their inputs and never read external state.
+Patterns are chainable methods on SpawnedGroup. Built-ins ship with the engine: `:Circle(radius, count)` lays members around a horizontal circle; `:Ring(radius, count, thickness)` is a circle with optional radial jitter; `:Grid(rows, cols, spacing)` lays a 2D grid; `:Cube(side, count)` and `:Sphere(radius, count)` fill volumes; `:Line(length, count)` runs a straight line along the local X axis; `:Wall(width, height, spacing)` tiles a vertical plane. Each pattern places members and returns the group, so patterns themselves chain — the example:
+
+```lua
+ObjectSpawner:SpawnGroup("PFB_Wall"):Wall(10, 4):Position(0, 0, 50):Rotation(0, 90, 0)
+```
+
+builds a wall, parks it, faces it. Order matters: pattern methods compute member offsets at call time relative to the current group transform, so later `Position`/`Rotation` moves the whole assembly. Patterns are idempotent over their inputs and never read external state.
 
 ## Registering custom patterns
 
-`myMod.Patterns:Register(name, fn)` adds a new pattern method to the SpawnedGroup builder. The pattern function receives `(group, ...args)` where `group` exposes the current origin, current rotation, the prefab name, and a `:AddMember(localOffset, localRotation?)` call. The function is responsible for calling `AddMember` once per desired position; the engine handles the actual host spawn calls and registry bookkeeping. Once registered, the pattern is available on every SpawnedGroup as a real method — `myMod.Patterns:Register("Spiral", function(group, radius, count, turns) ... end)` enables `ObjectSpawner:SpawnGroup("PFB_X"):Spiral(10, 50, 3)`. Names collide with built-ins are rejected; patterns are scoped to the engine instance so two mods cannot stomp on each other.
+The call:
+
+```lua
+LuluFluffysTrailmakersModEngine.Patterns:Register(name, fn)
+```
+
+adds a new pattern method to the SpawnedGroup builder. The pattern function receives `(group, ...args)` where `group` exposes the current origin, current rotation, the prefab name, and a `:AddMember(localOffset, localRotation?)` call. The function is responsible for calling `AddMember` once per desired position; the engine handles the actual host spawn calls and registry bookkeeping. Once registered, the pattern is available on every SpawnedGroup as a real method — registering a Spiral:
+
+```lua
+LuluFluffysTrailmakersModEngine.Patterns:Register("Spiral", function(group, radius, count, turns) ... end)
+```
+
+enables:
+
+```lua
+ObjectSpawner:SpawnGroup("PFB_X"):Spiral(10, 50, 3)
+```
+
+Names collide with built-ins are rejected; patterns are scoped to the engine instance so two mods cannot stomp on each other.
 
