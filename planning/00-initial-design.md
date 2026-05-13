@@ -35,3 +35,7 @@ Chat echo suppression is built in — the sister AI Chat Mod hand-rolls a TTL `e
 ## Phase 1 scope
 
 Phase 1 lands the core: `LFTME.New()` with `:GetService`, the `Signal` and `Connection` classes, `task.wait` and `task.spawn` over a frame loop, the `Enum` skeleton, `Vector3` and `Color3` datatypes, `ChatService` with `SendMessageTo` and `BroadcastToAll`, and `PlayersService` with `Player` objects plus `PlayerAdded` / `PlayerRemoving` signals. Echo suppression for chat is hidden inside the chat wrapper. Later phases add `Physics`, spawn patterns, `ModStorage`, `Logger`, and the broader enum tables.
+
+## Logger
+
+The Logger service writes to a  file in the mod directory via  (or its append equivalent). It never writes to chat, because the chat panel only renders six lines at once and logs would immediately burn that budget for any real player-visible message. The Logger exposes leveled methods (, , , ) and is decoupled from , which the host treats as console-only; Logger may additionally call  for parity but the file is the source of truth.
