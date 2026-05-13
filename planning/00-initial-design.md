@@ -39,3 +39,7 @@ Phase 1 lands the core: `LFTME.New()` with `:GetService`, the `Signal` and `Conn
 ## Logger
 
 The Logger service writes to a `logs.txt` file in the mod directory via `tm.os.WriteAllText_Dynamic` (or its append equivalent). It never writes to chat, because the chat panel only renders six lines at once and logs would immediately burn that budget for any real player-visible message. The Logger exposes leveled methods (`Logger:Debug`, `Logger:Info`, `Logger:Warn`, `Logger:Error`) and is decoupled from `tm.os.Log`, which the host treats as console-only; Logger may additionally call `tm.os.Log` for parity but the file is the source of truth.
+
+## Intrusive message formatting
+
+Intrusive popups support a subset of HTML-style formatting tags inside both `header` and `message` strings. Common tags: `<b>` or `<strong>` (bold), `<i>` or `<em>` (italics), `<mark>` (highlight), `<small>` (smaller text). Tags are paired — opening and closing required, e.g. `<b>Bold Text</b>`. The engine passes these through unmodified so callers retain full control. Chat lines (`Chat:SendMessageTo`) do not support these tags — the in-game chat panel renders plain text only, so the engine will document that formatting is intrusive-only and will not silently strip or convert tags between surfaces.
