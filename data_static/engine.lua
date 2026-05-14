@@ -2601,6 +2601,182 @@ function UpdateService:SetTargetDelta(dt)
     return self
 end
 
+
+--------------------------------------------------------------------------------
+-- Audit gap closures -- adds the host calls the chat-mod uses that the
+-- earlier extension pass missed.
+--------------------------------------------------------------------------------
+
+-- ModStorage:ReadStatic wraps tm.os.ReadAllText_Static (reads files from
+-- the mod's data_static/ folder; read-only at runtime).
+function ModStorage:ReadStatic(path)
+    _expectType("ModStorage", "ReadStatic", "path", "string", path)
+    if not (tm and tm.os and tm.os.ReadAllText_Static) then return nil end
+    local ok, contents = pcall(tm.os.ReadAllText_Static, path)
+    if not ok or type(contents) ~= "string" then return nil end
+    return contents
+end
+
+function ModStorage:ReadStaticJSON(path)
+    local text = self:ReadStatic(path)
+    if text == nil then return nil, "static file not found" end
+    if text == "" then return nil, "empty static file" end
+    return _json.decode(text)
+end
+
+-- Player:CanKill returns whether the host considers this player killable
+-- right now (false for invincible / between-death-and-respawn).
+function Player:CanKill()
+    if tm and tm.players and tm.players.CanKillPlayer then
+        local ok, v = pcall(tm.players.CanKillPlayer, self.Id)
+        if ok then return v and true or false end
+    end
+    return false
+end
+
+-- Player:GetOccupiedStructure returns the host structure id the player
+-- currently occupies, or nil if they are not in a seat / on a structure.
+function Player:GetOccupiedStructure()
+    if tm and tm.players and tm.players.OccupiedStructure then
+        local ok, v = pcall(tm.players.OccupiedStructure, self.Id)
+        if ok then return v end
+    end
+    return nil
+end
+
+-- Player:SetBlockLimit caps how many blocks this player can place. The
+-- host accepts a non-negative integer; 0 disables placement entirely.
+function Player:SetBlockLimit(n)
+    _expectType("Player", "SetBlockLimit", "n", "number", n)
+    if tm and tm.players and tm.players.SetBlockLimit then
+        pcall(tm.players.SetBlockLimit, self.Id, n)
+    end
+    return self
+end
+
+-- Player:SetSpawnPoint moves the player's per-session spawn location to
+-- the given Vector3. Most mods use this for "checkpoint" style features.
+function Player:SetSpawnPoint(position)
+    _expectInstance("Player", "SetSpawnPoint", "position", "Vector3", position)
+    if tm and tm.players and tm.players.SetPlayerSpawnLocation then
+        pcall(tm.players.SetPlayerSpawnLocation, self.Id,
+            _makeHostVec3(position.X, position.Y, position.Z))
+    elseif tm and tm.players and tm.players.SetSpawnPoint then
+        pcall(tm.players.SetSpawnPoint, self.Id,
+            _makeHostVec3(position.X, position.Y, position.Z))
+    end
+    return self
+end
+
+-- Players:SetGlobalSpawnPoint moves the default world spawn for everyone.
+-- Distinct from Player:SetSpawnPoint which is per-player.
+function Players:SetGlobalSpawnPoint(position)
+    _expectInstance("Players", "SetGlobalSpawnPoint", "position", "Vector3", position)
+    if tm and tm.players and tm.players.SetSpawnPoint then
+        pcall(tm.players.SetSpawnPoint,
+            _makeHostVec3(position.X, position.Y, position.Z))
+    end
+    return self
+end
+
+-- World:SetTimeOfDayCycleDuration sets the length of one full day cycle
+-- in seconds. Larger numbers mean slower day/night transitions.
+function World:SetTimeOfDayCycleDuration(seconds)
+    _expectType("World", "SetTimeOfDayCycleDuration", "seconds", "number", seconds)
+    if seconds <= 0 then
+        error(_runtimeError("World", "SetTimeOfDayCycleDuration",
+            "duration must be positive; got " .. tostring(seconds) .. "."), 0)
+    end
+    if tm and tm.world and tm.world.SetCycleDurationTimeOfDay then
+        pcall(tm.world.SetCycleDurationTimeOfDay, seconds)
+    end
+    return self
+end
+
+--------------------------------------------------------------------------------
+-- Camera service -- wraps tm.players camera APIs (per-player named cameras
+-- with activate/remove semantics). Per-player keyed by string name; the
+-- host enforces uniqueness within the same player id.
+--------------------------------------------------------------------------------
+
+local Camera = {}
+Camera.__index = Camera
+
+local function _newCamera()
+    return setmetatable({ _className = "Camera" }, Camera)
+end
+
+local function _cameraPlayerId(method, p)
+    if type(p) == "number" then return p end
+    if type(p) == "table" and p._className == "Player" then return p.Id end
+    _typeError("Camera", method, "player", "Player or numeric id", p)
+end
+
+-- Register a new named camera at position with optional Euler rotation.
+-- The host call signature is tm.players.AddCamera(id, name, position, rotation).
+function Camera:Add(player, name, position, rotation)
+    local id = _cameraPlayerId("Add", player)
+    _expectType("Camera", "Add", "name", "string", name)
+    _expectInstance("Camera", "Add", "position", "Vector3", position)
+    local hostPos = _makeHostVec3(position.X, position.Y, position.Z)
+    local hostRot
+    if rotation ~= nil then
+        _expectInstance("Camera", "Add", "rotation", "Vector3", rotation)
+        hostRot = _makeHostVec3(rotation.X, rotation.Y, rotation.Z)
+    else
+        hostRot = _makeHostVec3(0, 0, 0)
+    end
+    if tm and tm.players and tm.players.AddCamera then
+        pcall(tm.players.AddCamera, id, name, hostPos, hostRot)
+    end
+    return self
+end
+
+-- Switch the player's active view to the named camera.
+function Camera:Activate(player, name)
+    local id = _cameraPlayerId("Activate", player)
+    _expectType("Camera", "Activate", "name", "string", name)
+    if tm and tm.players and tm.players.ActivateCamera then
+        pcall(tm.players.ActivateCamera, id, name)
+    end
+    return self
+end
+
+-- Remove a named camera. No-op if the camera doesn't exist.
+function Camera:Remove(player, name)
+    local id = _cameraPlayerId("Remove", player)
+    _expectType("Camera", "Remove", "name", "string", name)
+    if tm and tm.players and tm.players.RemoveCamera then
+        pcall(tm.players.RemoveCamera, id, name)
+    end
+    return self
+end
+
+LFTME._registerService("Camera", function(_engine)
+    return _newCamera()
+end)
+
+--------------------------------------------------------------------------------
+-- Color3 presets -- chat-mod equivalents of tm.color.Red/Green/etc. Cached
+-- on the Color3 table so callers can write Color3.Red instead of
+-- Color3.new(1, 0, 0).
+--
+-- These are NOT functions; they are pre-constructed immutable values. To
+-- match tm.color semantics where the host functions return fresh values,
+-- callers should treat these as constants and not mutate.
+--------------------------------------------------------------------------------
+
+Color3.Red     = Color3.new(1, 0, 0)
+Color3.Green   = Color3.new(0, 1, 0)
+Color3.Blue    = Color3.new(0, 0, 1)
+Color3.Yellow  = Color3.new(1, 1, 0)
+Color3.Cyan    = Color3.new(0, 1, 1)
+Color3.Magenta = Color3.new(1, 0, 1)
+Color3.White   = Color3.new(1, 1, 1)
+Color3.Black   = Color3.new(0, 0, 0)
+Color3.Gray    = Color3.new(0.5, 0.5, 0.5)
+Color3.Grey    = Color3.Gray
+
 -- END_LFTME_EXTENSIONS
 --------------------------------------------------------------------------------
 -- 10. Engine singleton
