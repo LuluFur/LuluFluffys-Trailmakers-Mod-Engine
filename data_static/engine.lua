@@ -1956,6 +1956,652 @@ LFTME._registerService("ObjectSpawner", function(_engine)
     return _newObjectSpawner()
 end)
 
+-- BEGIN_LFTME_EXTENSIONS
+--------------------------------------------------------------------------------
+-- Extension services -- defines: ModStorage, World, UI, Audio services;
+-- extends Player with moderation/builder methods; extends ObjectSpawner with
+-- catalog, mesh registry, position-aware spawn, and clear-all; adds
+-- SpawnedObject:GetPosition; replaces the Player:SpawnObjectNearby stub.
+--
+-- Conventions match the rest of the engine: pcall around every host call,
+-- type-checked inputs via _expectType / _expectInstance, error templates
+-- via _typeError / _runtimeError, immutable inputs preserved.
+--------------------------------------------------------------------------------
+
+-- Lightweight JSON encoder/decoder used by ModStorage.
+local _json = {}
+
+local function _jsonEncodeString(s)
+    local out = { string.char(34) }
+    for i = 1, #s do
+        local c = s:byte(i)
+        if c == 34 then out[#out+1] = "\\\""
+        elseif c == 92 then out[#out+1] = "\\\\"
+        elseif c == 8 then out[#out+1] = "\b"
+        elseif c == 9 then out[#out+1] = "\t"
+        elseif c == 10 then out[#out+1] = "\n"
+        elseif c == 12 then out[#out+1] = "\f"
+        elseif c == 13 then out[#out+1] = "\r"
+        elseif c < 32 then out[#out+1] = string.format("\\u%04x", c)
+        else out[#out+1] = string.char(c) end
+    end
+    out[#out+1] = string.char(34)
+    return table.concat(out)
+end
+
+local function _jsonEncodeValue(v, seen)
+    local t = type(v)
+    if v == nil then return "null"
+    elseif t == "boolean" then return v and "true" or "false"
+    elseif t == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then return "null" end
+        if v == math.floor(v) and math.abs(v) < 1e15 then
+            return string.format("%d", v)
+        end
+        return string.format("%.17g", v)
+    elseif t == "string" then return _jsonEncodeString(v)
+    elseif t == "table" then
+        if seen[v] then
+            error(_runtimeError("ModStorage", "Encode",
+                "cycle detected during JSON encode."), 0)
+        end
+        seen[v] = true
+        local n = #v
+        local isArray = n > 0
+        if isArray then
+            for k, _ in pairs(v) do
+                if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+                    isArray = false
+                    break
+                end
+            end
+        else
+            local hasAny = false
+            for _, _ in pairs(v) do hasAny = true; break end
+            if not hasAny then seen[v] = nil; return "{}" end
+        end
+        if isArray then
+            local parts = {}
+            for i = 1, n do parts[i] = _jsonEncodeValue(v[i], seen) end
+            seen[v] = nil
+            return "[" .. table.concat(parts, ",") .. "]"
+        else
+            local parts = {}
+            for k, val in pairs(v) do
+                if type(k) == "string" then
+                    parts[#parts+1] = _jsonEncodeString(k) .. ":" .. _jsonEncodeValue(val, seen)
+                end
+            end
+            seen[v] = nil
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+    end
+    error(_runtimeError("ModStorage", "Encode",
+        "cannot encode value of type " .. t .. "."), 0)
+end
+
+function _json.encode(value)
+    return _jsonEncodeValue(value, {})
+end
+
+function _json.decode(text)
+    if type(text) ~= "string" then
+        return nil, "JSON input is not a string"
+    end
+    local pos = 1
+    local len = #text
+    local function skipWs()
+        while pos <= len do
+            local c = text:byte(pos)
+            if c == 32 or c == 9 or c == 10 or c == 13 then pos = pos + 1
+            else break end
+        end
+    end
+    local parseValue
+    local function err(msg)
+        return nil, msg .. " at position " .. pos
+    end
+    local function parseString()
+        if text:byte(pos) ~= 34 then return err("expected quote") end
+        pos = pos + 1
+        local out = {}
+        while pos <= len do
+            local c = text:byte(pos)
+            if c == 34 then pos = pos + 1; return table.concat(out) end
+            if c == 92 then
+                pos = pos + 1
+                local esc = text:byte(pos)
+                if esc == 34 then out[#out+1] = "\""
+                elseif esc == 92 then out[#out+1] = "\\"
+                elseif esc == 47 then out[#out+1] = "/"
+                elseif esc == 98 then out[#out+1] = "\b"
+                elseif esc == 102 then out[#out+1] = "\f"
+                elseif esc == 110 then out[#out+1] = "\n"
+                elseif esc == 114 then out[#out+1] = "\r"
+                elseif esc == 116 then out[#out+1] = "\t"
+                elseif esc == 117 then
+                    local hex = text:sub(pos+1, pos+4)
+                    local n = tonumber(hex, 16)
+                    if not n then return err("bad unicode escape") end
+                    if n < 0x80 then
+                        out[#out+1] = string.char(n)
+                    elseif n < 0x800 then
+                        out[#out+1] = string.char(0xC0 + math.floor(n/0x40),
+                                                  0x80 + (n % 0x40))
+                    else
+                        out[#out+1] = string.char(0xE0 + math.floor(n/0x1000),
+                                                  0x80 + (math.floor(n/0x40) % 0x40),
+                                                  0x80 + (n % 0x40))
+                    end
+                    pos = pos + 4
+                else return err("bad escape") end
+                pos = pos + 1
+            else
+                out[#out+1] = string.char(c)
+                pos = pos + 1
+            end
+        end
+        return err("unterminated string")
+    end
+    local function parseNumber()
+        local start = pos
+        if text:byte(pos) == 45 then pos = pos + 1 end
+        while pos <= len do
+            local c = text:byte(pos)
+            if (c >= 48 and c <= 57) or c == 46 or c == 43 or c == 45
+                or c == 69 or c == 101 then
+                pos = pos + 1
+            else break end
+        end
+        local n = tonumber(text:sub(start, pos - 1))
+        if not n then return err("bad number") end
+        return n
+    end
+    local function parseArray()
+        pos = pos + 1
+        local out = {}
+        skipWs()
+        if text:byte(pos) == 93 then pos = pos + 1; return out end
+        while true do
+            skipWs()
+            local v, e = parseValue()
+            if e then return nil, e end
+            out[#out+1] = v
+            skipWs()
+            local c = text:byte(pos)
+            if c == 93 then pos = pos + 1; return out end
+            if c ~= 44 then return err("expected comma or ]") end
+            pos = pos + 1
+        end
+    end
+    local function parseObject()
+        pos = pos + 1
+        local out = {}
+        skipWs()
+        if text:byte(pos) == 125 then pos = pos + 1; return out end
+        while true do
+            skipWs()
+            local k, e = parseString()
+            if e then return nil, e end
+            skipWs()
+            if text:byte(pos) ~= 58 then return err("expected colon") end
+            pos = pos + 1
+            skipWs()
+            local v, ve = parseValue()
+            if ve then return nil, ve end
+            out[k] = v
+            skipWs()
+            local c = text:byte(pos)
+            if c == 125 then pos = pos + 1; return out end
+            if c ~= 44 then return err("expected comma or }") end
+            pos = pos + 1
+        end
+    end
+    parseValue = function()
+        skipWs()
+        local c = text:byte(pos)
+        if c == 34 then return parseString() end
+        if c == 123 then return parseObject() end
+        if c == 91 then return parseArray() end
+        if c == 116 and text:sub(pos, pos+3) == "true" then pos = pos + 4; return true end
+        if c == 102 and text:sub(pos, pos+4) == "false" then pos = pos + 5; return false end
+        if c == 110 and text:sub(pos, pos+3) == "null" then pos = pos + 4; return nil end
+        if c == 45 or (c and c >= 48 and c <= 57) then return parseNumber() end
+        return err("unexpected character")
+    end
+    local v, e = parseValue()
+    if e then return nil, e end
+    return v
+end
+
+--------------------------------------------------------------------------------
+-- ModStorage service. Wraps tm.os.ReadAllText_Dynamic / WriteAllText_Dynamic.
+-- Missing files return nil rather than throwing. JSON helpers included.
+--------------------------------------------------------------------------------
+
+local ModStorage = {}
+ModStorage.__index = ModStorage
+
+local function _newModStorage()
+    return setmetatable({ _className = "ModStorage" }, ModStorage)
+end
+
+function ModStorage:Read(path)
+    _expectType("ModStorage", "Read", "path", "string", path)
+    if not (tm and tm.os and tm.os.ReadAllText_Dynamic) then return nil end
+    local ok, contents = pcall(tm.os.ReadAllText_Dynamic, path)
+    if not ok or type(contents) ~= "string" then return nil end
+    return contents
+end
+
+function ModStorage:Write(path, contents)
+    _expectType("ModStorage", "Write", "path", "string", path)
+    _expectType("ModStorage", "Write", "contents", "string", contents)
+    if tm and tm.os and tm.os.WriteAllText_Dynamic then
+        pcall(tm.os.WriteAllText_Dynamic, path, contents)
+    end
+    return self
+end
+
+function ModStorage:ReadJSON(path)
+    local text = self:Read(path)
+    if text == nil then return nil, "file not found" end
+    if text == "" then return nil, "empty file" end
+    return _json.decode(text)
+end
+
+function ModStorage:WriteJSON(path, value)
+    _expectType("ModStorage", "WriteJSON", "path", "string", path)
+    self:Write(path, _json.encode(value))
+    return self
+end
+
+function ModStorage:Exists(path)
+    return self:Read(path) ~= nil
+end
+
+function ModStorage:AppendLine(path, line)
+    _expectType("ModStorage", "AppendLine", "path", "string", path)
+    _expectType("ModStorage", "AppendLine", "line", "string", line)
+    local existing = self:Read(path) or ""
+    if #existing > 0 and existing:sub(-1) ~= "\n" then existing = existing .. "\n" end
+    self:Write(path, existing .. line .. "\n")
+    return self
+end
+
+ModStorage.JSON = {
+    Encode = function(v) return _json.encode(v) end,
+    Decode = function(s) return _json.decode(s) end,
+}
+
+LFTME._registerService("ModStorage", function(_engine)
+    return _newModStorage()
+end)
+
+--------------------------------------------------------------------------------
+-- World service. TimeOfDay [0..100], Gravity multiplier, TimeScale,
+-- GlobalWind (Vector3), MapName, BuildComplexity. All getters return
+-- engine-native types; never throw.
+--------------------------------------------------------------------------------
+
+local World = {}
+World.__index = World
+
+local function _newWorld()
+    return setmetatable({ _className = "World" }, World)
+end
+
+function World:GetTimeOfDay()
+    if tm and tm.world and tm.world.GetTimeOfDay then
+        local ok, v = pcall(tm.world.GetTimeOfDay)
+        if ok and type(v) == "number" then return v end
+    end
+    return 0
+end
+
+function World:SetTimeOfDay(t)
+    _expectType("World", "SetTimeOfDay", "t", "number", t)
+    if t < 0 or t > 100 then
+        error(_runtimeError("World", "SetTimeOfDay",
+            "value " .. tostring(t) .. " is out of range [0, 100]."), 0)
+    end
+    if tm and tm.world and tm.world.SetTimeOfDay then
+        pcall(tm.world.SetTimeOfDay, t)
+    end
+    return self
+end
+
+function World:SetTimeOfDayPaused(paused)
+    _expectType("World", "SetTimeOfDayPaused", "paused", "boolean", paused)
+    if tm and tm.world and tm.world.SetPausedTimeOfDay then
+        pcall(tm.world.SetPausedTimeOfDay, paused)
+    end
+    return self
+end
+
+function World:GetGravity()
+    if tm and tm.physics and tm.physics.GetGravityMultiplier then
+        local ok, v = pcall(tm.physics.GetGravityMultiplier)
+        if ok and type(v) == "number" then return v end
+    end
+    return 1
+end
+
+function World:SetGravity(multiplier)
+    _expectType("World", "SetGravity", "multiplier", "number", multiplier)
+    if tm and tm.physics and tm.physics.SetGravityMultiplier then
+        pcall(tm.physics.SetGravityMultiplier, multiplier)
+    end
+    return self
+end
+
+function World:GetTimeScale()
+    if tm and tm.physics and tm.physics.GetTimeScale then
+        local ok, v = pcall(tm.physics.GetTimeScale)
+        if ok and type(v) == "number" then return v end
+    end
+    return 1
+end
+
+function World:SetTimeScale(scale)
+    _expectType("World", "SetTimeScale", "scale", "number", scale)
+    if tm and tm.physics and tm.physics.SetTimeScale then
+        pcall(tm.physics.SetTimeScale, scale)
+    end
+    return self
+end
+
+function World:SetGlobalWind(a, b, c)
+    local x, y, z
+    if _isInstanceOf(a, "Vector3") then
+        x, y, z = a.X, a.Y, a.Z
+    elseif type(a) == "number" and type(b) == "number" and type(c) == "number" then
+        x, y, z = a, b, c
+    else
+        _typeError("World", "SetGlobalWind", "wind",
+            "Vector3 or (x, y, z) numbers", a)
+    end
+    if tm and tm.world and tm.world.SetGlobalWind then
+        pcall(tm.world.SetGlobalWind, _makeHostVec3(x, y, z))
+    end
+    return self
+end
+
+function World:GetMapName()
+    if tm and tm.physics and tm.physics.GetMapName then
+        local ok, v = pcall(tm.physics.GetMapName)
+        if ok and type(v) == "string" then return v end
+    end
+    return ""
+end
+
+function World:SetBuildComplexity(n)
+    _expectType("World", "SetBuildComplexity", "n", "number", n)
+    if tm and tm.physics and tm.physics.SetBuildComplexity then
+        pcall(tm.physics.SetBuildComplexity, n)
+    end
+    return self
+end
+
+LFTME._registerService("World", function(_engine)
+    return _newWorld()
+end)
+
+--------------------------------------------------------------------------------
+-- UI service. Thin wrapper over tm.playerUI. Caller is responsible for
+-- key namespacing.
+--------------------------------------------------------------------------------
+
+local UI = {}
+UI.__index = UI
+
+local function _newUI()
+    return setmetatable({ _className = "UI" }, UI)
+end
+
+local function _uiPlayerId(method, p)
+    if type(p) == "number" then return p end
+    if type(p) == "table" and p._className == "Player" then return p.Id end
+    _typeError("UI", method, "player", "Player or numeric id", p)
+end
+
+function UI:AddLabel(player, key, text)
+    local id = _uiPlayerId("AddLabel", player)
+    _expectType("UI", "AddLabel", "key", "string", key)
+    _expectType("UI", "AddLabel", "text", "string", text)
+    if tm and tm.playerUI and tm.playerUI.AddUILabel then
+        pcall(tm.playerUI.AddUILabel, id, key, text)
+    end
+    return self
+end
+
+function UI:UpdateLabel(player, key, text)
+    return self:AddLabel(player, key, text)
+end
+
+function UI:ClearLabels(player)
+    local id = _uiPlayerId("ClearLabels", player)
+    if tm and tm.playerUI and tm.playerUI.ClearUI then
+        pcall(tm.playerUI.ClearUI, id)
+    end
+    return self
+end
+
+function UI:ShowIntrusive(title, body, duration)
+    _expectType("UI", "ShowIntrusive", "title", "string", title)
+    _expectType("UI", "ShowIntrusive", "body", "string", body)
+    if duration ~= nil then
+        _expectType("UI", "ShowIntrusive", "duration", "number", duration)
+    end
+    if tm and tm.playerUI and tm.playerUI.ShowIntrusiveMessageForAllPlayers then
+        pcall(tm.playerUI.ShowIntrusiveMessageForAllPlayers, title, body, duration or 5)
+    end
+    return self
+end
+
+function UI:ShowSubtle(title, body, duration)
+    _expectType("UI", "ShowSubtle", "title", "string", title)
+    _expectType("UI", "ShowSubtle", "body", "string", body)
+    if duration ~= nil then
+        _expectType("UI", "ShowSubtle", "duration", "number", duration)
+    end
+    if tm and tm.playerUI and tm.playerUI.AddSubtleMessageForAllPlayers then
+        pcall(tm.playerUI.AddSubtleMessageForAllPlayers, title, body, duration or 5)
+    end
+    return self
+end
+
+LFTME._registerService("UI", function(_engine)
+    return _newUI()
+end)
+
+--------------------------------------------------------------------------------
+-- Audio service.
+--------------------------------------------------------------------------------
+
+local Audio = {}
+Audio.__index = Audio
+
+local function _newAudio()
+    return setmetatable({ _className = "Audio" }, Audio)
+end
+
+function Audio:PlayAtPosition(position, name)
+    _expectInstance("Audio", "PlayAtPosition", "position", "Vector3", position)
+    _expectType("Audio", "PlayAtPosition", "name", "string", name)
+    if tm and tm.audio and tm.audio.PlayAudioAtPosition then
+        pcall(tm.audio.PlayAudioAtPosition,
+            _makeHostVec3(position.X, position.Y, position.Z), name)
+    end
+    return self
+end
+
+LFTME._registerService("Audio", function(_engine)
+    return _newAudio()
+end)
+
+--------------------------------------------------------------------------------
+-- Player extension methods (attached after the Player class definition).
+--------------------------------------------------------------------------------
+
+function Player:TeleportToSpawn()
+    if tm and tm.players and tm.players.TeleportPlayerToSpawnPoint then
+        pcall(tm.players.TeleportPlayerToSpawnPoint, self.Id)
+    end
+    return self
+end
+
+function Player:SetBuilderEnabled(enabled)
+    _expectType("Player", "SetBuilderEnabled", "enabled", "boolean", enabled)
+    if tm and tm.players and tm.players.SetBuilderEnabled then
+        pcall(tm.players.SetBuilderEnabled, self.Id, enabled)
+    end
+    return self
+end
+
+function Player:SetRepairEnabled(enabled)
+    _expectType("Player", "SetRepairEnabled", "enabled", "boolean", enabled)
+    if tm and tm.players and tm.players.SetRepairEnabled then
+        pcall(tm.players.SetRepairEnabled, self.Id, enabled)
+    end
+    return self
+end
+
+function Player:GetProfileId()
+    if tm and tm.players and tm.players.GetPlayerProfileId then
+        local ok, v = pcall(tm.players.GetPlayerProfileId, self.Id)
+        if ok and v ~= nil then return tostring(v) end
+    end
+    return ""
+end
+
+-- Replace the earlier stub with a working impl.
+function Player:SpawnObjectNearby(prefab, offset)
+    local engine = LFTME.Get()
+    if engine == nil then
+        error(_runtimeError("Player", "SpawnObjectNearby",
+            "engine has not been constructed. Call LFTME.New() first."), 0)
+    end
+    local spawner = engine:GetService("ObjectSpawner")
+    local pos = self:GetPosition()
+    if offset ~= nil then
+        _expectInstance("Player", "SpawnObjectNearby", "offset", "Vector3", offset)
+        pos = pos + offset
+    end
+    local obj = spawner:SpawnObject(prefab)
+    obj:Position(pos)
+    return obj
+end
+
+--------------------------------------------------------------------------------
+-- SpawnedObject extension: position reader.
+--------------------------------------------------------------------------------
+
+function SpawnedObject:GetPosition()
+    _ensureLive(self, "GetPosition")
+    local result = Vector3.new(0, 0, 0)
+    _withTransform(self, function(t)
+        if t.GetPositionWorld then
+            local ok, hostVec = pcall(t.GetPositionWorld, t)
+            if ok and hostVec then
+                result = _hostVec3ToVector3(hostVec)
+            end
+        end
+    end)
+    return result
+end
+
+--------------------------------------------------------------------------------
+-- ObjectSpawner extensions: catalog, mesh registry, position-aware spawn,
+-- clear-all, custom-mesh spawn.
+--------------------------------------------------------------------------------
+
+function ObjectSpawner:SpawnAt(prefab, position)
+    local resolved, err = self:ResolvePrefab(prefab)
+    if not resolved then error(err, 0) end
+    _expectInstance("ObjectSpawner", "SpawnAt", "position", "Vector3", position)
+    if not (tm and tm.physics and tm.physics.SpawnObject) then
+        error(_runtimeError("ObjectSpawner", "SpawnAt",
+            "host API tm.physics.SpawnObject is not available."), 0)
+    end
+    local ok, modGameObject = pcall(tm.physics.SpawnObject,
+        _makeHostVec3(position.X, position.Y, position.Z), resolved)
+    if not ok or not modGameObject then
+        error(_runtimeError("ObjectSpawner", "SpawnAt",
+            "host failed to spawn " .. resolved .. ": " .. tostring(modGameObject)), 0)
+    end
+    return _newSpawnedObject(modGameObject, resolved)
+end
+
+function ObjectSpawner:GetCatalog()
+    if not (tm and tm.physics and tm.physics.SpawnableNames) then return {} end
+    local ok, names = pcall(tm.physics.SpawnableNames)
+    if not ok or type(names) ~= "table" then return {} end
+    local out = {}
+    for i = 1, #names do out[i] = names[i] end
+    return out
+end
+
+function ObjectSpawner:ClearAllSpawns()
+    if tm and tm.physics and tm.physics.ClearAllSpawns then
+        pcall(tm.physics.ClearAllSpawns)
+    end
+    return self
+end
+
+function ObjectSpawner:AddMesh(name, data)
+    _expectType("ObjectSpawner", "AddMesh", "name", "string", name)
+    _expectType("ObjectSpawner", "AddMesh", "data", "string", data)
+    if tm and tm.physics and tm.physics.AddMesh then
+        pcall(tm.physics.AddMesh, name, data)
+    end
+    return self
+end
+
+function ObjectSpawner:AddTexture(name, data)
+    _expectType("ObjectSpawner", "AddTexture", "name", "string", name)
+    _expectType("ObjectSpawner", "AddTexture", "data", "string", data)
+    if tm and tm.physics and tm.physics.AddTexture then
+        pcall(tm.physics.AddTexture, name, data)
+    end
+    return self
+end
+
+function ObjectSpawner:SpawnCustom(position, meshName, textureName)
+    _expectInstance("ObjectSpawner", "SpawnCustom", "position", "Vector3", position)
+    _expectType("ObjectSpawner", "SpawnCustom", "meshName", "string", meshName)
+    _expectType("ObjectSpawner", "SpawnCustom", "textureName", "string", textureName)
+    if not (tm and tm.physics and tm.physics.SpawnCustomObjectConcave) then
+        error(_runtimeError("ObjectSpawner", "SpawnCustom",
+            "host API tm.physics.SpawnCustomObjectConcave is not available."), 0)
+    end
+    local ok, modGameObject = pcall(tm.physics.SpawnCustomObjectConcave,
+        _makeHostVec3(position.X, position.Y, position.Z), meshName, textureName)
+    if not ok or not modGameObject then
+        error(_runtimeError("ObjectSpawner", "SpawnCustom",
+            "host failed to spawn custom mesh " .. meshName .. ": " ..
+            tostring(modGameObject)), 0)
+    end
+    return _newSpawnedObject(modGameObject, meshName)
+end
+
+--------------------------------------------------------------------------------
+-- UpdateService extension: SetTargetDelta wrapping tm.os.SetModTargetDeltaTime.
+--------------------------------------------------------------------------------
+
+function UpdateService:SetTargetDelta(dt)
+    _expectType("UpdateService", "SetTargetDelta", "dt", "number", dt)
+    if dt <= 0 then
+        error(_runtimeError("UpdateService", "SetTargetDelta",
+            "delta must be positive; got " .. tostring(dt) .. "."), 0)
+    end
+    if tm and tm.os and tm.os.SetModTargetDeltaTime then
+        pcall(tm.os.SetModTargetDeltaTime, dt)
+    end
+    return self
+end
+
+-- END_LFTME_EXTENSIONS
 --------------------------------------------------------------------------------
 -- 10. Engine singleton
 --
