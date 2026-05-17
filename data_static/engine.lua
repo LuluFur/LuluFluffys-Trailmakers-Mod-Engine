@@ -978,7 +978,15 @@ function UpdateService:_pump(dt)
                 -- as dead. We treat that as a normal end-of-life rather
                 -- than an error -- finished tasks are fine to silently
                 -- skip.
-                if coroutine.status(co) ~= "dead" then
+                --
+                -- Defence-in-depth: re-check Cancelled here as well as
+                -- in the outer loop. A previous entry processed in this
+                -- same tick may have cancelled this entry's handle via
+                -- a side effect (e.g. another task calling h:Cancel()
+                -- on the handle that owns the current coroutine).
+                if entry.handle and entry.handle.Cancelled then
+                    -- handle was cancelled mid-tick; drop without resume
+                elseif coroutine.status(co) ~= "dead" then
                     local ok, err = coroutine.resume(co)
                     if not ok then
                         _logSchedulerError("task.spawn coroutine error: " .. tostring(err))
@@ -1007,10 +1015,15 @@ function UpdateService:_pump(dt)
     end
 
     -- Carry over anything that was added during this tick (those live
-    -- past the original end of the list right now).
+    -- past the original end of the list right now). Skip carry-overs
+    -- whose handle was cancelled mid-tick so cancellation latency is
+    -- exactly one pump tick instead of two.
     local total = #self._queue
     for i = count + 1, total do
-        keep[#keep + 1] = self._queue[i]
+        local carry = self._queue[i]
+        if not (carry.handle and carry.handle.Cancelled) then
+            keep[#keep + 1] = carry
+        end
     end
 
     self._queue = keep
