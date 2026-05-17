@@ -2300,7 +2300,49 @@ end)
 -- Same style rules as the rest of the engine: every Trailmakers call is
 -- wrapped in a safety net, every argument is type-checked, errors use
 -- the same prefix format pointing back at your code.
+--
+-- ERROR MODEL FOR MUTATORS (B5):
+-- Set*/mutator methods in this section wrap their host call with
+-- `_hostCallWarn(service, method, hostFn, ...)` instead of a bare
+-- `pcall`. On host-call failure the helper routes the error string
+-- through `LFTME._logger:Warn` (falling back to `tm.os.Log` if no
+-- Logger is constructed yet) before returning. The method still
+-- returns `self` so chaining is not broken, but the failure is no
+-- longer silent -- mods see a warning in their log instead of a
+-- mysteriously no-op `World:SetGravity(...)`. Query/getter methods
+-- keep their existing `local ok, value = pcall(...)` style because
+-- they need to propagate the value on success. Logger internals and
+-- init-time event-handler registration deliberately keep the bare
+-- `pcall` to avoid recursion and startup-order coupling.
 --------------------------------------------------------------------------------
+
+-- Internal: wrap a host (`tm.*`) call so failures are surfaced through
+-- the engine logger instead of silently discarded. Used by every
+-- mutator/Set* method in this section so the engine has one consistent
+-- error story for host-call failures.
+--
+-- Returns the underlying `pcall` tuple (ok, result_or_err) so the
+-- caller can branch on success if it cares, but most mutators just
+-- discard it and `return self`.
+local function _hostCallWarn(service, method, hostFn, ...)
+    if hostFn == nil then
+        return true, nil
+    end
+    local ok, err = pcall(hostFn, ...)
+    if not ok then
+        local logger = LFTME._logger
+        local label = "[" .. tostring(service) .. ":" .. tostring(method) .. "]"
+        if logger and logger.Warn then
+            pcall(logger.Warn, logger,
+                label .. " host call failed: " .. tostring(err))
+        elseif tm and tm.os and tm.os.Log then
+            pcall(tm.os.Log,
+                "[LFTME] " .. label .. " host call failed: " .. tostring(err))
+        end
+    end
+    return ok, err
+end
+
 
 -- A small JSON encoder/decoder used by ModStorage so your mod can save
 -- and load tables as files. You usually do not call `_json.*` directly;
@@ -2594,7 +2636,7 @@ function ModStorage:Write(path, contents)
     _expectType("ModStorage", "Write", "path", "string", path)
     _expectType("ModStorage", "Write", "contents", "string", contents)
     if tm and tm.os and tm.os.WriteAllText_Dynamic then
-        pcall(tm.os.WriteAllText_Dynamic, path, contents)
+        _hostCallWarn("ModStorage", "Write", tm.os.WriteAllText_Dynamic, path, contents)
     end
     return self
 end
@@ -2701,7 +2743,7 @@ function World:SetTimeOfDay(t)
             "value " .. tostring(t) .. " is out of range [0, 100]."), 0)
     end
     if tm and tm.world and tm.world.SetTimeOfDay then
-        pcall(tm.world.SetTimeOfDay, t)
+        _hostCallWarn("World", "SetTimeOfDay", tm.world.SetTimeOfDay, t)
     end
     return self
 end
@@ -2713,7 +2755,7 @@ end
 function World:SetTimeOfDayPaused(paused)
     _expectType("World", "SetTimeOfDayPaused", "paused", "boolean", paused)
     if tm and tm.world and tm.world.SetPausedTimeOfDay then
-        pcall(tm.world.SetPausedTimeOfDay, paused)
+        _hostCallWarn("World", "SetTimeOfDayPaused", tm.world.SetPausedTimeOfDay, paused)
     end
     return self
 end
@@ -2739,7 +2781,7 @@ end
 function World:SetGravity(multiplier)
     _expectType("World", "SetGravity", "multiplier", "number", multiplier)
     if tm and tm.physics and tm.physics.SetGravityMultiplier then
-        pcall(tm.physics.SetGravityMultiplier, multiplier)
+        _hostCallWarn("World", "SetGravity", tm.physics.SetGravityMultiplier, multiplier)
     end
     return self
 end
@@ -2762,7 +2804,7 @@ end
 function World:SetTimeScale(scale)
     _expectType("World", "SetTimeScale", "scale", "number", scale)
     if tm and tm.physics and tm.physics.SetTimeScale then
-        pcall(tm.physics.SetTimeScale, scale)
+        _hostCallWarn("World", "SetTimeScale", tm.physics.SetTimeScale, scale)
     end
     return self
 end
@@ -2783,7 +2825,7 @@ function World:SetGlobalWind(a, b, c)
             "Vector3 or (x, y, z) numbers", a)
     end
     if tm and tm.world and tm.world.SetGlobalWind then
-        pcall(tm.world.SetGlobalWind, _makeHostVec3(x, y, z))
+        _hostCallWarn("World", "SetGlobalWind", tm.world.SetGlobalWind, _makeHostVec3(x, y, z))
     end
     return self
 end
@@ -2808,7 +2850,7 @@ end
 function World:SetBuildComplexity(n)
     _expectType("World", "SetBuildComplexity", "n", "number", n)
     if tm and tm.physics and tm.physics.SetBuildComplexity then
-        pcall(tm.physics.SetBuildComplexity, n)
+        _hostCallWarn("World", "SetBuildComplexity", tm.physics.SetBuildComplexity, n)
     end
     return self
 end
@@ -2857,7 +2899,7 @@ function UI:AddLabel(player, key, text)
     _expectType("UI", "AddLabel", "key", "string", key)
     _expectType("UI", "AddLabel", "text", "string", text)
     if tm and tm.playerUI and tm.playerUI.AddUILabel then
-        pcall(tm.playerUI.AddUILabel, id, key, text)
+        _hostCallWarn("UI", "AddLabel", tm.playerUI.AddUILabel, id, key, text)
     end
     return self
 end
@@ -2877,7 +2919,7 @@ end
 function UI:ClearLabels(player)
     local id = _uiPlayerId("ClearLabels", player)
     if tm and tm.playerUI and tm.playerUI.ClearUI then
-        pcall(tm.playerUI.ClearUI, id)
+        _hostCallWarn("UI", "ClearLabels", tm.playerUI.ClearUI, id)
     end
     return self
 end
@@ -2894,7 +2936,7 @@ function UI:ShowIntrusive(title, body, duration)
         _expectType("UI", "ShowIntrusive", "duration", "number", duration)
     end
     if tm and tm.playerUI and tm.playerUI.ShowIntrusiveMessageForAllPlayers then
-        pcall(tm.playerUI.ShowIntrusiveMessageForAllPlayers, title, body, duration or 5)
+        _hostCallWarn("UI", "ShowIntrusive", tm.playerUI.ShowIntrusiveMessageForAllPlayers, title, body, duration or 5)
     end
     return self
 end
@@ -2911,7 +2953,7 @@ function UI:ShowSubtle(title, body, duration)
         _expectType("UI", "ShowSubtle", "duration", "number", duration)
     end
     if tm and tm.playerUI and tm.playerUI.AddSubtleMessageForAllPlayers then
-        pcall(tm.playerUI.AddSubtleMessageForAllPlayers, title, body, duration or 5)
+        _hostCallWarn("UI", "ShowSubtle", tm.playerUI.AddSubtleMessageForAllPlayers, title, body, duration or 5)
     end
     return self
 end
@@ -2949,7 +2991,7 @@ function Audio:PlayAtPosition(position, name)
     _expectInstance("Audio", "PlayAtPosition", "position", "Vector3", position)
     _expectType("Audio", "PlayAtPosition", "name", "string", name)
     if tm and tm.audio and tm.audio.PlayAudioAtPosition then
-        pcall(tm.audio.PlayAudioAtPosition,
+        _hostCallWarn("Audio", "PlayAtPosition", tm.audio.PlayAudioAtPosition,
             _makeHostVec3(position.X, position.Y, position.Z), name)
     end
     return self
@@ -2968,7 +3010,7 @@ end)
 -- (wraps `tm.players.TeleportPlayerToSpawnPoint`).
 function Player:TeleportToSpawn()
     if tm and tm.players and tm.players.TeleportPlayerToSpawnPoint then
-        pcall(tm.players.TeleportPlayerToSpawnPoint, self.Id)
+        _hostCallWarn("Player", "TeleportToSpawn", tm.players.TeleportPlayerToSpawnPoint, self.Id)
     end
     return self
 end
@@ -2980,7 +3022,7 @@ end
 function Player:SetBuilderEnabled(enabled)
     _expectType("Player", "SetBuilderEnabled", "enabled", "boolean", enabled)
     if tm and tm.players and tm.players.SetBuilderEnabled then
-        pcall(tm.players.SetBuilderEnabled, self.Id, enabled)
+        _hostCallWarn("Player", "SetBuilderEnabled", tm.players.SetBuilderEnabled, self.Id, enabled)
     end
     return self
 end
@@ -2991,7 +3033,7 @@ end
 function Player:SetRepairEnabled(enabled)
     _expectType("Player", "SetRepairEnabled", "enabled", "boolean", enabled)
     if tm and tm.players and tm.players.SetRepairEnabled then
-        pcall(tm.players.SetRepairEnabled, self.Id, enabled)
+        _hostCallWarn("Player", "SetRepairEnabled", tm.players.SetRepairEnabled, self.Id, enabled)
     end
     return self
 end
@@ -3099,7 +3141,7 @@ end
 -- props. Returns self for chaining (wraps `tm.physics.ClearAllSpawns`).
 function ObjectSpawner:ClearAllSpawns()
     if tm and tm.physics and tm.physics.ClearAllSpawns then
-        pcall(tm.physics.ClearAllSpawns)
+        _hostCallWarn("ObjectSpawner", "ClearAllSpawns", tm.physics.ClearAllSpawns)
     end
     return self
 end
@@ -3113,7 +3155,7 @@ function ObjectSpawner:AddMesh(name, data)
     _expectType("ObjectSpawner", "AddMesh", "name", "string", name)
     _expectType("ObjectSpawner", "AddMesh", "data", "string", data)
     if tm and tm.physics and tm.physics.AddMesh then
-        pcall(tm.physics.AddMesh, name, data)
+        _hostCallWarn("ObjectSpawner", "AddMesh", tm.physics.AddMesh, name, data)
     end
     return self
 end
@@ -3126,7 +3168,7 @@ function ObjectSpawner:AddTexture(name, data)
     _expectType("ObjectSpawner", "AddTexture", "name", "string", name)
     _expectType("ObjectSpawner", "AddTexture", "data", "string", data)
     if tm and tm.physics and tm.physics.AddTexture then
-        pcall(tm.physics.AddTexture, name, data)
+        _hostCallWarn("ObjectSpawner", "AddTexture", tm.physics.AddTexture, name, data)
     end
     return self
 end
@@ -3172,7 +3214,7 @@ function UpdateService:SetTargetDelta(dt)
             "delta must be positive; got " .. tostring(dt) .. "."), 0)
     end
     if tm and tm.os and tm.os.SetModTargetDeltaTime then
-        pcall(tm.os.SetModTargetDeltaTime, dt)
+        _hostCallWarn("UpdateService", "SetTargetDelta", tm.os.SetModTargetDeltaTime, dt)
     end
     return self
 end
@@ -3239,7 +3281,7 @@ end
 function Player:SetBlockLimit(n)
     _expectType("Player", "SetBlockLimit", "n", "number", n)
     if tm and tm.players and tm.players.SetBlockLimit then
-        pcall(tm.players.SetBlockLimit, self.Id, n)
+        _hostCallWarn("Player", "SetBlockLimit", tm.players.SetBlockLimit, self.Id, n)
     end
     return self
 end
@@ -3251,10 +3293,10 @@ end
 function Player:SetSpawnPoint(position)
     _expectInstance("Player", "SetSpawnPoint", "position", "Vector3", position)
     if tm and tm.players and tm.players.SetPlayerSpawnLocation then
-        pcall(tm.players.SetPlayerSpawnLocation, self.Id,
+        _hostCallWarn("Player", "SetSpawnPoint", tm.players.SetPlayerSpawnLocation, self.Id,
             _makeHostVec3(position.X, position.Y, position.Z))
     elseif tm and tm.players and tm.players.SetSpawnPoint then
-        pcall(tm.players.SetSpawnPoint, self.Id,
+        _hostCallWarn("Player", "SetSpawnPoint", tm.players.SetSpawnPoint, self.Id,
             _makeHostVec3(position.X, position.Y, position.Z))
     end
     return self
@@ -3267,7 +3309,7 @@ end
 function Players:SetGlobalSpawnPoint(position)
     _expectInstance("Players", "SetGlobalSpawnPoint", "position", "Vector3", position)
     if tm and tm.players and tm.players.SetSpawnPoint then
-        pcall(tm.players.SetSpawnPoint,
+        _hostCallWarn("Players", "SetGlobalSpawnPoint", tm.players.SetSpawnPoint,
             _makeHostVec3(position.X, position.Y, position.Z))
     end
     return self
@@ -3285,7 +3327,7 @@ function World:SetTimeOfDayCycleDuration(seconds)
             "duration must be positive; got " .. tostring(seconds) .. "."), 0)
     end
     if tm and tm.world and tm.world.SetCycleDurationTimeOfDay then
-        pcall(tm.world.SetCycleDurationTimeOfDay, seconds)
+        _hostCallWarn("World", "SetTimeOfDayCycleDuration", tm.world.SetCycleDurationTimeOfDay, seconds)
     end
     return self
 end
@@ -3338,7 +3380,7 @@ function Camera:Add(player, name, position, rotation)
         hostRot = _makeHostVec3(0, 0, 0)
     end
     if tm and tm.players and tm.players.AddCamera then
-        pcall(tm.players.AddCamera, id, name, hostPos, hostRot)
+        _hostCallWarn("Camera", "Add", tm.players.AddCamera, id, name, hostPos, hostRot)
     end
     return self
 end
@@ -3350,7 +3392,7 @@ function Camera:Activate(player, name)
     local id = _cameraPlayerId("Activate", player)
     _expectType("Camera", "Activate", "name", "string", name)
     if tm and tm.players and tm.players.ActivateCamera then
-        pcall(tm.players.ActivateCamera, id, name)
+        _hostCallWarn("Camera", "Activate", tm.players.ActivateCamera, id, name)
     end
     return self
 end
@@ -3362,7 +3404,7 @@ function Camera:Remove(player, name)
     local id = _cameraPlayerId("Remove", player)
     _expectType("Camera", "Remove", "name", "string", name)
     if tm and tm.players and tm.players.RemoveCamera then
-        pcall(tm.players.RemoveCamera, id, name)
+        _hostCallWarn("Camera", "Remove", tm.players.RemoveCamera, id, name)
     end
     return self
 end
