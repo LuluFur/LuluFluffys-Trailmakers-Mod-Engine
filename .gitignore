@@ -45,3 +45,6 @@ planning/
 # Temp review/response files — local only
 followup.md
 responses.md
+
+# Claude Code local state
+.claude/
