@@ -1890,7 +1890,18 @@ local function _newChat(playersService)
     local self = setmetatable({
         _className = "Chat",
         _senderName = DEFAULT_SENDER_NAME,
-        _echoMap = {},                 -- [senderName..NUL..message] = expiry clock
+        -- Echo suppression uses a per-(sender, message) counter rather
+        -- than a TTL+last-write-wins flag. Each outbound send bumps the
+        -- counter; each matching inbound chat consumes one count. This
+        -- avoids dropping a legitimate player message that happens to
+        -- match a recently-sent server message: only as many inbound
+        -- copies as we sent are suppressed.
+        --
+        -- Shape: _echoMap[key] = { count = N, expiry = clock + TTL }
+        -- expiry exists only to garbage-collect entries the host never
+        -- echoes back (offline, future API change). Counts at zero are
+        -- removed eagerly.
+        _echoMap = {},
         _playersService = playersService,
         MessageReceived = _newSignal("Chat.MessageReceived"),
     }, Chat)
@@ -1905,10 +1916,17 @@ local function _newChat(playersService)
             -- loops.
             local now = (_updateServiceInstance and _updateServiceInstance._clock) or 0
             local key = tostring(senderName) .. "\0" .. tostring(message)
-            local expiry = self._echoMap[key]
-            if expiry and expiry > now then
-                self._echoMap[key] = nil
+            local entry = self._echoMap[key]
+            if entry and entry.expiry > now and entry.count > 0 then
+                entry.count = entry.count - 1
+                if entry.count <= 0 then
+                    self._echoMap[key] = nil
+                end
                 return
+            elseif entry and entry.expiry <= now then
+                -- stale entry whose echo never arrived; drop it so it
+                -- cannot suppress a future genuine player message
+                self._echoMap[key] = nil
             end
             -- Try to look the sender up as a Player. `FindByName`
             -- returns `(nil, err)` if it cannot match a name; we just
@@ -1953,7 +1971,13 @@ function Chat:SendMessageTo(player, message)
     local senderName = self._senderName
     local now = (_updateServiceInstance and _updateServiceInstance._clock) or 0
     local key = senderName .. "\0" .. message
-    self._echoMap[key] = now + ECHO_SUPPRESSION_TTL
+    local entry = self._echoMap[key]
+    if entry and entry.expiry > now then
+        entry.count = entry.count + 1
+        entry.expiry = now + ECHO_SUPPRESSION_TTL
+    else
+        self._echoMap[key] = { count = 1, expiry = now + ECHO_SUPPRESSION_TTL }
+    end
     if tm and tm.playerUI and tm.playerUI.SendChatMessage then
         pcall(tm.playerUI.SendChatMessage, senderName, message)
     end
