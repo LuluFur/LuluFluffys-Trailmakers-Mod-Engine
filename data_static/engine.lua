@@ -2320,10 +2320,34 @@ local function _jsonEncodeValue(v, seen)
             seen[v] = nil
             return "[" .. table.concat(parts, ",") .. "]"
         else
+            -- Object branch. JSON keys must be strings. We coerce
+            -- numeric keys to their string form (matching JavaScript's
+            -- JSON.stringify: `{[2]="a"}` -> `{"2":"a"}`). Previously
+            -- non-string keys were silently dropped, which caused
+            -- ModStorage:WriteJSON to lose data without warning. Bool,
+            -- table, and function keys are still rejected with an
+            -- explicit error rather than silent loss.
             local parts = {}
             for k, val in pairs(v) do
-                if type(k) == "string" then
+                local kt = type(k)
+                if kt == "string" then
                     parts[#parts+1] = _jsonEncodeString(k) .. ":" .. _jsonEncodeValue(val, seen)
+                elseif kt == "number" then
+                    if k ~= k or k == math.huge or k == -math.huge then
+                        error(_runtimeError("ModStorage", "Encode",
+                            "cannot encode table with NaN or +/-inf key."), 0)
+                    end
+                    local keyStr
+                    if k == math.floor(k) and math.abs(k) < 1e15 then
+                        keyStr = string.format("%d", k)
+                    else
+                        keyStr = string.format("%.17g", k)
+                    end
+                    parts[#parts+1] = _jsonEncodeString(keyStr) .. ":" .. _jsonEncodeValue(val, seen)
+                else
+                    error(_runtimeError("ModStorage", "Encode",
+                        "cannot encode table with key of type " .. kt ..
+                        " (only string and number keys are supported)."), 0)
                 end
             end
             seen[v] = nil
