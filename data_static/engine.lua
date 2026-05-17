@@ -1753,10 +1753,13 @@ end)
 -- The Chat service covers TWO different on-screen surfaces in
 -- Trailmakers, with one method each:
 --
---   * Chat:SendMessageTo(player, message)
+--   * Chat:SendMessage(message)
 --       A normal chat line in the chat panel. By default it appears
 --       to come from "Server" -- change that with
---       `Chat:SetSenderName("...")`.
+--       `Chat:SetSenderName("...")`. (Trailmakers' chat API can only
+--       broadcast, so every player sees the line. The older name
+--       `SendMessageTo(player, message)` is kept as a deprecated alias
+--       that drops the `player` arg and warns once.)
 --
 --   * Chat:BroadcastToAll(header, body, duration?)
 --       A big middle-of-screen popup that EVERY player sees. There is
@@ -1958,16 +1961,14 @@ end
 
 -- Send a chat line that every player will see in their chat panel.
 -- It will be shown as if it came from the sender name you configured
--- (default "Server"; change with `Chat:SetSenderName`). The `player`
--- argument is currently mostly ceremonial -- Trailmakers' chat API only
--- supports broadcasting, so the message goes to everyone regardless.
--- We accept it now so a future per-player chat API can drop in cleanly.
--- The engine notes the (sender, message) pair for a moment so the
--- inbound chat handler can drop Trailmakers' own self-echo. Returns
--- self for chaining (wraps `tm.playerUI.SendChatMessage`).
-function Chat:SendMessageTo(player, message)
-    _expectInstance("Chat", "SendMessageTo", "player", "Player", player)
-    _expectType("Chat", "SendMessageTo", "message", "string", message)
+-- (default "Server"; change with `Chat:SetSenderName`). Trailmakers'
+-- chat API can only broadcast -- there is no per-player chat surface,
+-- so a single send reaches everyone. The engine notes the (sender,
+-- message) pair for a moment so the inbound chat handler can drop
+-- Trailmakers' own self-echo. Returns self for chaining (wraps
+-- `tm.playerUI.SendChatMessage`).
+function Chat:SendMessage(message)
+    _expectType("Chat", "SendMessage", "message", "string", message)
     local senderName = self._senderName
     local now = (_updateServiceInstance and _updateServiceInstance._clock) or 0
     local key = senderName .. "\0" .. message
@@ -1982,6 +1983,30 @@ function Chat:SendMessageTo(player, message)
         pcall(tm.playerUI.SendChatMessage, senderName, message)
     end
     return self
+end
+
+-- Deprecated. Older name that took a `player` argument it could not
+-- honour -- Trailmakers' chat API only broadcasts. The `player` arg is
+-- dropped and the call is forwarded to `Chat:SendMessage(message)`.
+-- The first call per Chat instance logs a one-shot warning so mods
+-- migrate; subsequent calls forward silently. Will be removed in a
+-- future engine version.
+function Chat:SendMessageTo(player, message)
+    _expectInstance("Chat", "SendMessageTo", "player", "Player", player)
+    _expectType("Chat", "SendMessageTo", "message", "string", message)
+    if not self._sendMessageToWarned then
+        self._sendMessageToWarned = true
+        local logger = LFTME._logger
+        if logger and logger.Warn then
+            pcall(logger.Warn, logger,
+                "[Chat:SendMessageTo] deprecated; use Chat:SendMessage(message). " ..
+                "The `player` argument was never honoured -- Trailmakers' chat API broadcasts.")
+        elseif tm and tm.os and tm.os.Log then
+            pcall(tm.os.Log,
+                "[LFTME] Chat:SendMessageTo deprecated; use Chat:SendMessage(message).")
+        end
+    end
+    return self:SendMessage(message)
 end
 
 -- Show a big middle-of-screen popup to every player. Two ways to call:
