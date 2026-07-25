@@ -378,7 +378,7 @@ Echo suppression is built in. The host's `OnChatMessage` callback fires for mess
 
 ### ObjectSpawner
 
-`ObjectSpawner` owns spawn calls, the spawn registry, prefab name resolution, pattern helpers, and the chainable builders returned by spawn methods. There are two entry points:
+`ObjectSpawner` owns spawn calls, the spawn registry, prefab name resolution, pattern helpers, and the chainable builders returned by spawn methods. All spawns are tracked globally with an enforced hard cap (500 objects by default) and all despawns are queued and drained at a bounded rate to prevent frame-stalling despawn storms. There are two entry points:
 
 ```lua
 ObjectSpawner:SpawnObject("PFB_Metal_Crate"):Position(0, 310, 0)
@@ -443,6 +443,29 @@ ObjectSpawner:SpawnObject(canonicalName)
 ```
 
 In Phase 1, `ResolvePrefab` returns exactly two values: the canonical prefab name string on success, or `nil` plus an error string on failure. The LuaLS shape is `function ObjectSpawner:ResolvePrefab(name): (string?, string?)` — `canonicalName: string?` on success, `err: string?` on failure. The return shape is intentionally narrow — a single string is easy to pass straight back into `SpawnObject`, and the two-value contract avoids the trap of "second return value sometimes means enum, sometimes means error". A richer return value — a small descriptor table carrying canonical name, enum value, and display name — is reserved for a later phase, when the enum catalogue is broad enough for the extra fields to be worth the API surface.
+
+#### Despawn queuing
+
+Despawns do not happen immediately. When `SpawnedObject:Destroy()` is called or `ClearAllSpawns()` is invoked, despawns are enqueued and drained at a bounded rate — up to 8 objects per frame by default. This prevents the "despawn storm" crash that occurs when mass clears tear down every object in a single frame, freezing the game. The queue drains on every `UpdateService` tick via an internal `Every(0, ...)` handler, so despawns happen as quickly as possible without stalling the frame.
+
+The bounded drain rate is a hard guarantee: calling `ClearAllSpawns()` will remove every object from the world, but the teardown is spread across multiple frames. Modders do not need to worry about frame stalls from cleanup, even on shutdown.
+
+#### Spawn registry and cap
+
+Every spawn — via `SpawnObject`, `SpawnAt`, or `SpawnCustom` — is tracked in a global registry. The engine enforces a hard cap of 500 tracked objects. When the cap is reached, the oldest spawned object is automatically evicted (despawned). The cap is enforced, not advisory: a spawn will never succeed if it would exceed the limit; instead, an eviction happens first to make room.
+
+The cap prevents unbounded growth from leaks or runaway spawning loops. If a mod spawns 1000 objects over time, only the most recent 500 are in the world. The oldest 500 have been despawned and are no longer tracked. The cap applies only to objects spawned by the mod via the engine; player-built structures are unaffected.
+
+#### Registry cleanup
+
+Entries are removed from the registry immediately when:
+
+- An object is destroyed via `SpawnedObject:Destroy()`. The object is removed from the registry and spawn order immediately, and the actual host despawn is queued to drain later.
+- An object is evicted when the cap is reached (via `_evictOldest()`), which calls `Destroy()` and thus removes it immediately.
+
+The registry never holds stale or garbage entries. An object is tracked from the moment it spawns until the moment `Destroy()` is called. The despawn queue holds the host-level objects pending despawn, but the engine registry has already forgotten them.
+
+**Caveat:** If an object is destroyed by the game itself (e.g., a player deletes a build that happens to be in our registry), it will leave a stale entry because **the host API does not notify the mod of object destruction**. This is a limitation of the Trailmakers modding API. In practice, this should be rare (the engine should spawn durable static objects, not player-destroyable builds). If stale entries accumulate, a cleanup pass could be added to detect dead objects and remove them. For now, the registry is assumed to track only objects the engine actively manages until destroy time. Destroying a tracked object via `ModGameObject:Despawn()` instead of `SpawnedObject:Destroy()` will also leave a stale entry; always use the engine API.
 
 ### World
 

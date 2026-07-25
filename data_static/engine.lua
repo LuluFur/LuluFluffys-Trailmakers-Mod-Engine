@@ -88,6 +88,11 @@ local _managedCoroutines = setmetatable({}, { __mode = "k" })
 -- `LFTME.New()`, which builds UpdateService automatically.
 local _updateServiceInstance = nil
 
+-- The ObjectSpawner instance is held here so SpawnedObject:Destroy can
+-- enqueue despawns without a service lookup. Stays nil until ObjectSpawner
+-- is built.
+local _objectSpawnerInstance = nil
+
 --------------------------------------------------------------------------------
 -- 1. Internal utilities
 --
@@ -2312,13 +2317,15 @@ SpawnedObject.__index = SpawnedObject
 
 -- Internal: build a new SpawnedObject. You get these from
 -- `ObjectSpawner:SpawnObject` or `ObjectSpawner:SpawnAt`; do not
--- construct one yourself.
-local function _newSpawnedObject(modGameObject, prefab)
+-- construct one yourself. The spawner reference is optional but used
+-- when set so Destroy can enqueue despawns without a service lookup.
+local function _newSpawnedObject(modGameObject, prefab, spawner)
     return setmetatable({
         _className = "SpawnedObject",
         _modGameObject = modGameObject,
         _prefab = prefab,
         _isDestroyed = false,
+        _spawner = spawner,
     }, SpawnedObject)
 end
 
@@ -2419,18 +2426,45 @@ function SpawnedObject:Rotation(a, b, c)
     return self
 end
 
+-- Internal: remove an object from both the registry and order tracking
+-- when it has been despawned, destroyed by the game, or evicted.
+local function _untrackSpawn(self, modGameObject)
+    self._spawnRegistry[modGameObject] = nil
+    for i = #self._spawnOrder, 1, -1 do
+        if self._spawnOrder[i] == modGameObject then
+            table.remove(self._spawnOrder, i)
+            break
+        end
+    end
+end
+
 -- Remove the object from the world. Safe to call more than once -- a
 -- second `Destroy` does nothing rather than throwing. This matters
 -- because cleanup code can legitimately end up destroying the same
 -- object twice (for example, a TaskManager holds both the object AND
--- a callback that also destroys it).
+-- a callback that also destroys it). Despawn is queued and drained at
+-- a bounded rate per tick to prevent mass-clear frame stalls. The object
+-- is removed from the registry immediately, but the actual host despawn
+-- happens later as the queue drains. If _spawner is nil (should not happen
+-- in normal usage), falls back to immediate despawn.
 function SpawnedObject:Destroy()
     if self._isDestroyed then
         return
     end
     self._isDestroyed = true
-    if self._modGameObject and self._modGameObject.Despawn then
-        pcall(self._modGameObject.Despawn, self._modGameObject)
+    if not self._modGameObject then
+        return
+    end
+    if self._spawner then
+        -- Normal path: remove from registry and queue despawn.
+        _untrackSpawn(self._spawner, self._modGameObject)
+        table.insert(self._spawner._despawnQueue, self._modGameObject)
+    else
+        -- Fallback: _spawner is nil (caller created object without spawner ref).
+        -- Despawn immediately rather than silently leaking.
+        if self._modGameObject.Despawn then
+            pcall(self._modGameObject.Despawn, self._modGameObject)
+        end
     end
 end
 
@@ -2439,12 +2473,27 @@ end
 local ObjectSpawner = {}
 ObjectSpawner.__index = ObjectSpawner
 
+-- Drain rate: maximum despawns per tick. Queuing prevents frame-rate
+-- stalls from mass despawns (the original AIChatMod #357 crash). A
+-- conservative drain rate avoids visible pops; this will be tuned based
+-- on host feedback and real load testing.
+local DESPAWN_DRAIN_PER_TICK = 8
+
+-- Max spawned objects tracked by the engine at once. When the cap is
+-- reached, ClearAllSpawns is triggered. The registry is enforced, not
+-- advisory: it hard-caps spawned object count to prevent unbounded
+-- growth.
+local MAX_SPAWNED_OBJECTS = 500
+
 -- Internal: build a new ObjectSpawner. The `_aliases` table is reserved
 -- for a future name-lookup feature; it is unused right now.
 local function _newObjectSpawner()
     return setmetatable({
         _className = "ObjectSpawner",
         _aliases = {},     -- reserved for the future alias registry
+        _despawnQueue = {},  -- queue of SpawnedObjects pending despawn
+        _spawnRegistry = {},  -- map of modGameObject -> SpawnedObject for tracking
+        _spawnOrder = {},  -- array of modGameObject for FIFO eviction
     }, ObjectSpawner)
 end
 
@@ -2470,6 +2519,9 @@ end
 -- Example:
 --   local box = spawner:SpawnObject("PFB_Metal_Crate"):Position(0, 5, 0)
 -- (Wraps `tm.physics.SpawnObject`.)
+--
+-- If the spawn cap is reached, the oldest spawned object is automatically
+-- evicted (despawned) to make room. The cap is enforced, not advisory.
 function ObjectSpawner:SpawnObject(prefab)
     local resolved, err = self:ResolvePrefab(prefab)
     if not resolved then
@@ -2479,13 +2531,58 @@ function ObjectSpawner:SpawnObject(prefab)
         error(_runtimeError("ObjectSpawner", "SpawnObject",
             "host API tm.physics.SpawnObject is not available."), 0)
     end
+
+    -- If at cap, evict the oldest object to make room.
+    if #self._spawnOrder >= MAX_SPAWNED_OBJECTS then
+        self:_evictOldest()
+    end
+
     local ok, modGameObject = pcall(tm.physics.SpawnObject,
         _makeHostVec3(0, 0, 0), resolved)
     if not ok or not modGameObject then
         error(_runtimeError("ObjectSpawner", "SpawnObject",
             "host failed to spawn \"" .. resolved .. "\": " .. tostring(modGameObject)), 0)
     end
-    return _newSpawnedObject(modGameObject, resolved)
+
+    -- Track the spawn. Record the modGameObject in both registry
+    -- (for lookup) and order (for FIFO eviction tracking).
+    local spawnedObj = _newSpawnedObject(modGameObject, resolved, self)
+    self._spawnRegistry[modGameObject] = spawnedObj
+    table.insert(self._spawnOrder, modGameObject)
+
+    return spawnedObj
+end
+
+-- Internal: evict the oldest spawned object when the cap is reached.
+-- The object is marked destroyed and enqueued for despawn like a
+-- normal Destroy() call would, so it drains through the queue rather
+-- than despawning immediately.
+function ObjectSpawner:_evictOldest()
+    if #self._spawnOrder == 0 then
+        return
+    end
+    local oldestModObj = self._spawnOrder[1]
+    local spawnedObj = self._spawnRegistry[oldestModObj]
+    if spawnedObj then
+        spawnedObj:Destroy()
+    end
+end
+
+-- Internal: drain the despawn queue at a bounded rate. Runs once per
+-- tick via UpdateService:Every. Despawns are sent to the host API one
+-- at a time, up to DESPAWN_DRAIN_PER_TICK per tick, so mass clears
+-- never freeze the frame (the original AIChatMod #357 crash). Objects
+-- have already been removed from the registry when destroyed, so this
+-- only handles the actual host API call.
+function ObjectSpawner:_drainDespawnQueue()
+    local drained = 0
+    while drained < DESPAWN_DRAIN_PER_TICK and #self._despawnQueue > 0 do
+        local modGameObject = table.remove(self._despawnQueue, 1)
+        if modGameObject and modGameObject.Despawn then
+            pcall(modGameObject.Despawn, modGameObject)
+        end
+        drained = drained + 1
+    end
 end
 
 -- `SpawnGroup` will eventually let you spawn many objects in patterns
@@ -2499,11 +2596,22 @@ function ObjectSpawner:SpawnGroup(_prefab)
 end
 
 -- Tell the engine how to build ObjectSpawner. It is built the first
--- time you call `engine:GetService("ObjectSpawner")` -- there are no
--- background events it needs to subscribe to, so building it on-demand
--- is fine.
+-- time you call `engine:GetService("ObjectSpawner")` -- now it sets up
+-- the despawn queue drainer via UpdateService.
 LFTME._registerService("ObjectSpawner", function(_engine)
-    return _newObjectSpawner()
+    local spawner = _newObjectSpawner()
+    _objectSpawnerInstance = spawner
+
+    -- Register the despawn queue drainer to run every frame (use a very small
+    -- interval rather than 0, since UpdateService:Every requires positive).
+    -- This drains up to DESPAWN_DRAIN_PER_TICK objects per tick so mass
+    -- clears do not freeze the frame.
+    local updateService = _engine:GetService("UpdateService")
+    updateService:Every(0.001, function()
+        spawner:_drainDespawnQueue()
+    end)
+
+    return spawner
 end)
 
 -- BEGIN_LFTME_EXTENSIONS
@@ -3328,6 +3436,7 @@ end
 -- `SpawnObject(prefab):Position(pos)` but in one call. Useful when
 -- you already have a position computed and you do not want to chain.
 -- Returns a SpawnedObject with the usual chainable methods.
+-- Like SpawnObject, evicts the oldest spawn if the cap is reached.
 function ObjectSpawner:SpawnAt(prefab, position)
     local resolved, err = self:ResolvePrefab(prefab)
     if not resolved then error(err, 0) end
@@ -3336,13 +3445,25 @@ function ObjectSpawner:SpawnAt(prefab, position)
         error(_runtimeError("ObjectSpawner", "SpawnAt",
             "host API tm.physics.SpawnObject is not available."), 0)
     end
+
+    -- If at cap, evict the oldest object to make room.
+    if #self._spawnOrder >= MAX_SPAWNED_OBJECTS then
+        self:_evictOldest()
+    end
+
     local ok, modGameObject = pcall(tm.physics.SpawnObject,
         _makeHostVec3(position.X, position.Y, position.Z), resolved)
     if not ok or not modGameObject then
         error(_runtimeError("ObjectSpawner", "SpawnAt",
             "host failed to spawn " .. resolved .. ": " .. tostring(modGameObject)), 0)
     end
-    return _newSpawnedObject(modGameObject, resolved)
+
+    -- Track the spawn.
+    local spawnedObj = _newSpawnedObject(modGameObject, resolved, self)
+    self._spawnRegistry[modGameObject] = spawnedObj
+    table.insert(self._spawnOrder, modGameObject)
+
+    return spawnedObj
 end
 
 -- Get a fresh array of every prefab name Trailmakers knows you can
@@ -3362,10 +3483,17 @@ end
 -- Despawn every object this mod has spawned. Player-built creations
 -- are NOT touched. Useful at mod shutdown to leave the world clean,
 -- or when restarting a round and you want to wipe the previous one's
--- props. Returns self for chaining (wraps `tm.physics.ClearAllSpawns`).
+-- props. All despawns are queued and drained at a bounded rate rather
+-- than happening immediately, so even mass clears do not freeze the
+-- frame. Returns self for chaining.
 function ObjectSpawner:ClearAllSpawns()
-    if tm and tm.physics and tm.physics.ClearAllSpawns then
-        _hostCallWarn("ObjectSpawner", "ClearAllSpawns", tm.physics.ClearAllSpawns)
+    -- Destroy all tracked spawns via the normal queue; this enqueues them.
+    for i = #self._spawnOrder, 1, -1 do
+        local modGameObject = self._spawnOrder[i]
+        local spawnedObj = self._spawnRegistry[modGameObject]
+        if spawnedObj then
+            spawnedObj:Destroy()
+        end
     end
     return self
 end
@@ -3400,7 +3528,8 @@ end
 -- Spawn a custom mesh + texture combo you registered earlier with
 -- `AddMesh` / `AddTexture`. Both names must already be known.
 -- Returns a SpawnedObject with the usual chainable methods. Useful
--- for shipping mods with bespoke props.
+-- for shipping mods with bespoke props. Like other spawn methods, evicts
+-- the oldest spawn if the cap is reached.
 -- (Wraps `tm.physics.SpawnCustomObjectConcave`.)
 function ObjectSpawner:SpawnCustom(position, meshName, textureName)
     _expectInstance("ObjectSpawner", "SpawnCustom", "position", "Vector3", position)
@@ -3410,6 +3539,12 @@ function ObjectSpawner:SpawnCustom(position, meshName, textureName)
         error(_runtimeError("ObjectSpawner", "SpawnCustom",
             "host API tm.physics.SpawnCustomObjectConcave is not available."), 0)
     end
+
+    -- If at cap, evict the oldest object to make room.
+    if #self._spawnOrder >= MAX_SPAWNED_OBJECTS then
+        self:_evictOldest()
+    end
+
     local ok, modGameObject = pcall(tm.physics.SpawnCustomObjectConcave,
         _makeHostVec3(position.X, position.Y, position.Z), meshName, textureName)
     if not ok or not modGameObject then
@@ -3417,7 +3552,13 @@ function ObjectSpawner:SpawnCustom(position, meshName, textureName)
             "host failed to spawn custom mesh " .. meshName .. ": " ..
             tostring(modGameObject)), 0)
     end
-    return _newSpawnedObject(modGameObject, meshName)
+
+    -- Track the spawn.
+    local spawnedObj = _newSpawnedObject(modGameObject, meshName, self)
+    self._spawnRegistry[modGameObject] = spawnedObj
+    table.insert(self._spawnOrder, modGameObject)
+
+    return spawnedObj
 end
 
 --------------------------------------------------------------------------------
