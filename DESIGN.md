@@ -528,6 +528,34 @@ local score = ModStorage:Get("highScore")
 
 `Set` is synchronous in Phase 1 and performs a real file write on each call. Do not call it from every `OnUpdate` tick or from any other hot loop — the stutter from rewriting the storage file at frame rate will be visible. Cache frequently-changing values in memory and flush to `ModStorage` on a coarse interval (`UpdateService:Every(10, ...)` is a common pattern) or on shutdown. A future phase may add a debounced `Set` or an explicit `Flush` method; until then, batching is the caller's responsibility.
 
+### Table Registry
+
+Every mod carries per-player state — caches, cooldowns, flags — usually stored in simple tables keyed by player id. The tedious part is cleanup: when a player leaves or ghosts, you must remember to sweep that player's row from every table, or it leaks forever. The engine's table registry automates this.
+
+Register a table once with `engine:TrackTable(tbl, spec)` and get automatic cleanup on leave and ghost. The `spec` table describes how to find a player's rows:
+
+```lua
+local playerCache = {}
+engine:TrackTable(playerCache, { perPlayer = "direct" })
+-- playerCache is now keyed by player id: playerCache[player.Id] = { ... }
+-- When the player leaves, their row is cleared automatically.
+```
+
+For tables with more complex keys, pass a function that extracts the player id:
+
+```lua
+local cooldowns = {}
+engine:TrackTable(cooldowns, { perPlayer = function(key)
+    return key.playerId
+end })
+-- cooldowns[{playerId=123, abilityName="Jump"}] = 45.0
+-- When player 123 leaves, all their ability cooldowns are cleared.
+```
+
+The registry uses weak keys so tables a mod abandons are garbage-collectable. Cleanup happens in place — the row is set to `nil` rather than rebinding the table — so both the mod's reference and the engine's internal registry still point to the same table. The engine sweeps registered tables automatically when a player leaves or ghosts, on the same frame the signal fires, before the player's `TaskManager` is destroyed. Mods do not need to hand-roll a sweep or remember to disconnect anything.
+
+The engine runs a periodic background sweep every 45 seconds (as a safety net for state drift) and a watchdog every 60 seconds that logs the total size of all registered tables. Leaks show up as monotonic growth in the watchdog logs; a table that bounces back to zero is healthy.
+
 ### UpdateService
 
 `UpdateService` exposes the engine's frame loop. Phase 1 ships a single signal:
