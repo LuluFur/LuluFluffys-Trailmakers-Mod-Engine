@@ -342,7 +342,7 @@ Chat.MessageReceived:Connect(function(player, msg)
 end)
 ```
 
-Echo suppression is built in. The host's `OnChatMessage` callback fires for messages the engine itself sent via `SendChatMessage`, which would otherwise produce a feedback loop. The engine maintains an internal TTL-keyed `_echoMap` so user code never sees the echo. This is one of the principal pain points the engine absorbs.
+Echo suppression is built in. The host's `OnChatMessage` callback fires for messages the engine itself sent via `SendChatMessage`, which would otherwise produce a feedback loop. The engine maintains an internal `_echoMap` so user code never sees the echo. It counts rather than flags: each outbound send bumps a per-(sender, message) counter, and each matching inbound line consumes one count, so exactly as many copies as the engine sent are suppressed. A player who happens to type the same text as a recent server message is still delivered. The TTL on each entry exists only to discard counts whose echo never arrived. This is one of the principal pain points the engine absorbs.
 
 ### ObjectSpawner
 
