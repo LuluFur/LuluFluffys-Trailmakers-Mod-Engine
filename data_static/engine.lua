@@ -1717,6 +1717,90 @@ local function _normalizeName(name)
     return (name:lower():gsub("[%s_%-]", ""))
 end
 
+--------------------------------------------------------------------------------
+-- 6.5 Table Registry internals
+--
+-- State and helpers for per-player table cleanup. Mods call
+-- engine:TrackTable(tbl, spec) to register once; cleanup is automatic
+-- on leave/ghost. Uses weak keys so tables can be garbage-collected.
+--------------------------------------------------------------------------------
+
+local _trackedTableSpecs = setmetatable({}, { __mode = "k" })
+local _trackedTableSizes = setmetatable({}, { __mode = "k" })
+
+-- Extract player id from a key using the keyFn. Tolerates errors.
+local function _extractPlayerId(key, keyFn)
+    local ok, result = pcall(keyFn, key)
+    if not ok then
+        return nil
+    end
+    return result
+end
+
+-- Sweep one table for a leaving/ghosting player.
+local function _sweepTableForPlayer(tbl, spec, playerId)
+    if spec.perPlayer == "direct" then
+        tbl[playerId] = nil
+    else
+        for k in pairs(tbl) do
+            if _extractPlayerId(k, spec.keyFn) == playerId then
+                tbl[k] = nil
+            end
+        end
+    end
+end
+
+-- Sweep all registered tables for a player.
+local function _sweepAllTablesForPlayer(playerId)
+    for tbl, spec in pairs(_trackedTableSpecs) do
+        _sweepTableForPlayer(tbl, spec, playerId)
+    end
+end
+
+-- Register a table with the registry.
+local function _trackTableInternal(tbl, spec)
+    _trackedTableSpecs[tbl] = spec
+    _trackedTableSizes[tbl] = 0
+end
+
+-- Background periodic sweep (safety net for state drift).
+local _lastSweptPlayers = {}
+local function _periodicSweep()
+    local Players = (_engineInstance and _engineInstance:GetService("Players")) or nil
+    if not Players then
+        return
+    end
+    local currentPlayers = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        currentPlayers[p.Id] = true
+    end
+    for sweptId, _ in pairs(_lastSweptPlayers) do
+        if not currentPlayers[sweptId] then
+            _sweepAllTablesForPlayer(sweptId)
+        end
+    end
+    _lastSweptPlayers = currentPlayers
+end
+
+-- Watchdog: report table registry size periodically.
+local function _watchdog()
+    local totalSize = 0
+    local tableCount = 0
+    for tbl, spec in pairs(_trackedTableSpecs) do
+        local size = 0
+        for _ in pairs(tbl) do
+            size = size + 1
+        end
+        _trackedTableSizes[tbl] = size
+        totalSize = totalSize + size
+        tableCount = tableCount + 1
+    end
+    local logger = LFTME._logger
+    if logger then
+        logger:Debug("Table registry watchdog: " .. tableCount .. " tables, " .. totalSize .. " total rows")
+    end
+end
+
 -- Internal: build the Players service. Subscribes to Trailmakers'
 -- join/leave events and pre-fills from anyone already in the session.
 -- All Trailmakers calls are wrapped in safety nets so the service can
@@ -1785,6 +1869,8 @@ local function _newPlayers()
                 -- Fire the signal first so your handlers can still
                 -- read or use the player's TaskManager one last time.
                 self.PlayerLeftServer:Fire(p)
+                -- Sweep registered tables for this player.
+                _sweepAllTablesForPlayer(modPlayer.playerId)
                 -- Then destroy the player's TaskManager. That releases
                 -- everything in it, including any last-minute tasks
                 -- the handlers above just added.
@@ -1810,6 +1896,8 @@ local function _newPlayers()
         -- Fire the signal first so handlers can still read and use the
         -- player before we clean up the TaskManager.
         self.PlayerGhosted:Fire(p)
+        -- Sweep registered tables for this ghosted player.
+        _sweepAllTablesForPlayer(playerId)
         -- Destroy the player's TaskManager to stop ticking permanently.
         if p.TaskManager and not p.TaskManager._isDestroyed then
             pcall(p.TaskManager.Destroy, p.TaskManager)
@@ -3715,6 +3803,34 @@ function Engine:GetService(name)
     return svc
 end
 
+-- Register a table for automatic per-player cleanup on leave and ghost
+-- sweep. Specify how to find a player's rows with `spec`:
+--   { perPlayer = "direct" } means the table is keyed by player id.
+--   { perPlayer = keyFn } means keyFn(key) returns the player id for
+--                        that key.
+-- When a player leaves or ghosts, all their rows are cleared in place
+-- (never rebind the table). The registry uses weak keys so tables the
+-- mod abandons are garbage-collectable.
+function Engine:TrackTable(tbl, spec)
+    _expectType("Engine", "TrackTable", "tbl", "table", tbl)
+    _expectType("Engine", "TrackTable", "spec", "table", spec)
+    if spec.perPlayer == nil then
+        error(_runtimeError("Engine", "TrackTable",
+            'spec missing required field "perPlayer".'), 0)
+    end
+    if spec.perPlayer ~= "direct" and type(spec.perPlayer) ~= "function" then
+        _typeError("Engine", "TrackTable", "spec.perPlayer",
+            '"direct" or function', spec.perPlayer)
+    end
+    local cleanSpec = { perPlayer = spec.perPlayer }
+    if spec.perPlayer ~= "direct" then
+        cleanSpec.keyFn = spec.perPlayer
+        cleanSpec.perPlayer = nil
+    end
+    _trackTableInternal(tbl, cleanSpec)
+    return self
+end
+
 -- Build the engine. This is what your `main.lua` calls right after
 -- loading this file. Throws if you call it twice -- there is only ever
 -- one engine per mod. Returns the engine instance.
@@ -3737,6 +3853,11 @@ function LFTME.New()
     -- to be hooked into Trailmakers before any code runs, so that a
     -- player joining the same instant the mod loads is not missed.
     self:GetService("Players")
+    -- Start the table registry's periodic sweep and watchdog. These use
+    -- UpdateService which we just built, so they can be scheduled now.
+    -- Sweep runs every 45 seconds, watchdog every 60 seconds.
+    _updateServiceInstance:Every(45, _periodicSweep)
+    _updateServiceInstance:Every(60, _watchdog)
     return self
 end
 
