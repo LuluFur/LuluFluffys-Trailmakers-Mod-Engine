@@ -2313,6 +2313,18 @@ function SpawnedObject:Rotation(a, b, c)
     return self
 end
 
+-- Internal: remove an object from both the registry and order tracking
+-- when it has been despawned, destroyed by the game, or evicted.
+local function _untrackSpawn(self, modGameObject)
+    self._spawnRegistry[modGameObject] = nil
+    for i = #self._spawnOrder, 1, -1 do
+        if self._spawnOrder[i] == modGameObject then
+            table.remove(self._spawnOrder, i)
+            break
+        end
+    end
+end
+
 -- Remove the object from the world. Safe to call more than once -- a
 -- second `Destroy` does nothing rather than throwing. This matters
 -- because cleanup code can legitimately end up destroying the same
@@ -2320,25 +2332,26 @@ end
 -- a callback that also destroys it). Despawn is queued and drained at
 -- a bounded rate per tick to prevent mass-clear frame stalls. The object
 -- is removed from the registry immediately, but the actual host despawn
--- happens later as the queue drains.
+-- happens later as the queue drains. If _spawner is nil (should not happen
+-- in normal usage), falls back to immediate despawn.
 function SpawnedObject:Destroy()
     if self._isDestroyed then
         return
     end
     self._isDestroyed = true
-    if self._modGameObject and self._spawner then
-        -- Remove from registry immediately so the cap is accurate.
-        local spawner = self._spawner
-        local modObj = self._modGameObject
-        spawner._spawnRegistry[modObj] = nil
-        for i = #spawner._spawnOrder, 1, -1 do
-            if spawner._spawnOrder[i] == modObj then
-                table.remove(spawner._spawnOrder, i)
-                break
-            end
+    if not self._modGameObject then
+        return
+    end
+    if self._spawner then
+        -- Normal path: remove from registry and queue despawn.
+        _untrackSpawn(self._spawner, self._modGameObject)
+        table.insert(self._spawner._despawnQueue, self._modGameObject)
+    else
+        -- Fallback: _spawner is nil (caller created object without spawner ref).
+        -- Despawn immediately rather than silently leaking.
+        if self._modGameObject.Despawn then
+            pcall(self._modGameObject.Despawn, self._modGameObject)
         end
-        -- The actual host despawn is queued and will drain at a bounded rate.
-        table.insert(spawner._despawnQueue, modObj)
     end
 end
 
@@ -2425,18 +2438,6 @@ function ObjectSpawner:SpawnObject(prefab)
     table.insert(self._spawnOrder, modGameObject)
 
     return spawnedObj
-end
-
--- Internal: remove an object from both the registry and order tracking
--- when it has been despawned, destroyed by the game, or evicted.
-local function _untrackSpawn(self, modGameObject)
-    self._spawnRegistry[modGameObject] = nil
-    for i = #self._spawnOrder, 1, -1 do
-        if self._spawnOrder[i] == modGameObject then
-            table.remove(self._spawnOrder, i)
-            break
-        end
-    end
 end
 
 -- Internal: evict the oldest spawned object when the cap is reached.
