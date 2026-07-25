@@ -1546,20 +1546,25 @@ end
 
 -- Check if the player still exists in the game. Probes the live game
 -- with `tm.players.GetPlayerTransform` to verify the player's character
--- is present. Returns true if the player is alive in the roster AND has
--- a character; false otherwise. If the probe throws or is absent, the
--- player is treated as nonexistent. This is a thin consistency check;
--- mods should not rely on polling this constantly -- use the
--- `Players:VerifyExists(id)` service method instead for automatic
--- failure tracking and ghost detection.
+-- is present. Returns three values: exists (bool), canProbe (bool), and error (string or nil).
+-- `canProbe` is true only if GetPlayerTransform is available. If canProbe is false, the
+-- probe was unavailable (not thrown) and existence is unknown -- this is NOT treated as
+-- nonexistence. `exists` is true only if canProbe is true and the probe succeeded. `error`
+-- is non-nil only if the probe threw or other errors occurred. This is a thin consistency
+-- check; mods should not rely on polling this constantly -- use the `Players:VerifyExists(id)`
+-- service method instead for failure tracking and ghost detection.
 function Player:Exists()
-    if tm and tm.players and tm.players.GetPlayerTransform then
-        local ok, transform = pcall(tm.players.GetPlayerTransform, self.Id)
-        if ok and transform then
-            return true
-        end
+    if not (tm and tm.players and tm.players.GetPlayerTransform) then
+        return false, false, nil
     end
-    return false
+    local ok, transform = pcall(tm.players.GetPlayerTransform, self.Id)
+    if not ok then
+        return false, true, transform
+    end
+    if transform then
+        return true, true, nil
+    end
+    return false, true, nil
 end
 
 -- Spawn a prefab right next to this player, with an optional Vector3
@@ -1689,6 +1694,18 @@ local function _newPlayers()
         self._byId[playerId] = nil
     end
 
+    -- Start automatic ghost detection on a 1-second interval. This runs
+    -- once per second, checking all current players and sweeping any that
+    -- have failed 4 consecutive probes. Mods do not have to call
+    -- VerifyExists manually to get ghost protection. UpdateService is
+    -- booted before Players in LFTME.New(), so _updateServiceInstance
+    -- is guaranteed to be set.
+    self._ghostSweepHandle = _updateServiceInstance:Every(1, function()
+        for playerId, _ in pairs(self._byId) do
+            self:VerifyExists(playerId)
+        end
+    end)
+
     return self
 end
 
@@ -1770,13 +1787,16 @@ function Players:Iterate()
 end
 
 -- Verify that a player (by id) still exists in the game. Tracks
--- consecutive failures with same-tick dedupe: if the player fails to
--- probe within the same tick, it counts as one failure. After 4
--- consecutive failures, the player is ruled a ghost and swept from the
--- roster. On any success, the failure counter resets to zero. Returns
--- true if the player is alive, false if ruled a ghost or not in the
--- roster. Mods should call this periodically (e.g., in an UpdateService
--- tick handler) for automatic ghost detection.
+-- consecutive existence-probe failures with same-tick dedupe: if the
+-- player fails to probe within the same tick, it counts as one failure.
+-- After 4 consecutive failures, the player is ruled a ghost and swept
+-- from the roster. On any probe success, the failure counter resets to
+-- zero. If the probe is unavailable (host function absent), the player
+-- is treated as alive and no failure is recorded. Returns true if the
+-- player is alive (either probe succeeded or probe unavailable), false
+-- if ruled a ghost or not in the roster. Call this periodically from an
+-- UpdateService handler (e.g., once per second) to detect ghosts without
+-- hand-rolling a polling loop.
 function Players:VerifyExists(playerId)
     _expectType("Players", "VerifyExists", "playerId", "number", playerId)
     local p = self._byId[playerId]
@@ -1787,8 +1807,16 @@ function Players:VerifyExists(playerId)
     -- Get the current tick from UpdateService for same-tick dedupe.
     local currentTick = (_updateServiceInstance and _updateServiceInstance._clock) or 0
 
-    -- Probe the player's existence.
-    local exists = p:Exists()
+    -- Probe the player's existence. Get all three return values.
+    local exists, canProbe, probeErr = p:Exists()
+
+    -- If the probe is unavailable, treat the player as alive.
+    -- We cannot make a judgment without evidence.
+    if not canProbe then
+        p._ghostFailures = 0
+        p._ghostFailureTick = nil
+        return true
+    end
 
     if exists then
         -- Reset the failure counter on success.
