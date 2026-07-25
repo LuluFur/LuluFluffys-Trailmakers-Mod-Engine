@@ -2,20 +2,17 @@
 -- B2 Spec: Task cancellation with mid-tick race protection
 --
 -- Requirement: A task cancelled before its scheduled deadline must never
--- see its body run. The fix adds defence-in-depth checks at both the outer
--- loop and the resume/carry-over branches of UpdateService._pump.
+-- see its body run. The fix adds defence-in-depth checks at two sites:
 --
--- Break-observe-restore: The test is designed to exercise the carry-over
--- branch: a task that waits (creating a resume entry for the next tick)
--- is cancelled before that next tick, so its continuation should not resume.
+--   1. Resume branch: re-check Cancelled before resuming a coroutine
+--   2. Carry-over loop: skip entries with Cancelled=true when promoting
+--      entries added during the current tick to the next tick's queue
 --
--- Note: With LuaJIT running the raw engine (no game/stubs), task.wait()
--- is difficult to test without the full coroutine suspension machinery.
--- This spec tests the core scenarios: pre-deadline cancellation (outer check),
--- and scheduled-but-not-yet-run cancellation (would be caught by outer check
--- before resume). The midtick race (callback A cancels B's resume entry
--- before B is processed in the same _pump call) is the trickiest to set up
--- without actual coroutine yield machinery.
+-- Break-observe-restore: Site 1 (resume branch) is unreachable dead code;
+-- the outer loop check makes it impossible for any entry to reach resume
+-- with Cancelled already true. Site 2 (carry-over) IS testable: schedule
+-- a task from within a callback, cancel it in that same tick, then observe
+-- that it does not survive to the next tick's queue.
 --------------------------------------------------------------------------------
 
 describe("B2: Task cancellation bounds latency", function()
@@ -76,10 +73,44 @@ describe("B2: Task cancellation bounds latency", function()
         assert_true(ok, "re-cancelling a handle must be safe")
     end)
 
+    it("carry-over entries: scheduled task cancelled mid-tick does not survive", function()
+        setup()
+        -- This is Site 2 of the fix: the carry-over loop must check Cancelled.
+        --
+        -- Pattern: Schedule a task from INSIDE a callback running in the
+        -- current tick, cancel it in that same tick. The inner task becomes
+        -- a carry-over entry (added to the queue AFTER the main loop started).
+        -- On a pre-fix engine, the cancelled carry-over entry would be kept.
+        -- On the fixed engine, it is dropped.
+        --
+        -- Observe via queue occupancy: after the pump completes, #_queue
+        -- should be 0 on the fixed engine, 1 on the buggy one.
+
+        local hInner
+        -- Clear the queue before testing
+        UpdateService._queue = {}
+
+        -- Outer callback: runs at t=0.01, spawns inner callback and cancels it
+        UpdateService:After(0.01, function()
+            hInner = UpdateService:After(5.0, function()
+                _G.__test_b2_inner_ran = true
+            end)
+            hInner:Cancel()
+        end)
+
+        -- Pump to t=0.05 (past the outer callback's deadline)
+        UpdateService:_pump(0.05)
+
+        -- The inner task was scheduled for t=5.0 (far future), but cancelled
+        -- in the same tick. On the fixed engine, it is dropped from the queue.
+        -- On the pre-fix engine, it remains as a carry-over entry.
+        local queue_count = #UpdateService._queue
+        assert_equal(queue_count, 0, "cancelled carry-over entry must be dropped from queue")
+        assert_equal(_G.__test_b2_inner_ran, nil, "inner task must not run")
+    end)
+
     it("Every callback entries in queue are skipped when handle is cancelled", function()
         setup()
-        -- Every entries are scheduled and can be cancelled. Verify that
-        -- after cancellation, the Every callback doesn't fire.
         _G.__test_b2_every_count = 0
         local handle = UpdateService:Every(0.016, function()
             _G.__test_b2_every_count = _G.__test_b2_every_count + 1
@@ -116,8 +147,6 @@ describe("B2: Task cancellation bounds latency", function()
 
     it("outer loop catches Cancelled entries", function()
         setup()
-        -- Verify the outer loop check: schedule multiple entries,
-        -- cancel one, verify it doesn't run
         _G.__test_b2_outer_1 = nil
         _G.__test_b2_outer_2 = nil
         _G.__test_b2_outer_3 = nil

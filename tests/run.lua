@@ -57,6 +57,11 @@ local function assert_type(value, expected_type, message)
     end
 end
 
+-- Global mutable stub for controlling host call behavior
+_G.__b5_host_config = {
+    should_throw = false,
+}
+
 -- Initialize the engine once
 local function load_engine()
     if LFTME_lib then
@@ -68,6 +73,34 @@ local function load_engine()
     if not engine_chunk then
         error("Failed to load engine from " .. engine_path .. ": " .. engine_err)
     end
+
+    -- Set up mutable tm stub before loading engine
+    -- Host functions close over __b5_host_config, so tests can toggle behavior
+    _G.tm = {
+        os = {
+            Log = function() end,
+            WriteAllText_Dynamic = function() end,
+            GetTime = function() return 0 end,
+        },
+        physics = {
+            GetGravityMultiplier = function() return 1 end,
+            SetGravityMultiplier = function(v)
+                if _G.__b5_host_config.should_throw then
+                    error("host call failed: simulated SetGravityMultiplier error")
+                end
+            end,
+            SetTimeScale = function(v)
+                if _G.__b5_host_config.should_throw then
+                    error("host call failed: simulated SetTimeScale error")
+                end
+            end,
+        },
+        world = {
+            SetTimeOfDay = function(t) end,
+            SetPausedTimeOfDay = function(p) end,
+            SetGlobalWind = function(x, y, z) end,
+        },
+    }
 
     -- Create a minimal environment for the engine
     local engine_env = {
@@ -93,6 +126,7 @@ local function load_engine()
         xpcall = xpcall,
         debug = debug,
         coroutine = coroutine,
+        tm = _G.tm,  -- Pass the mutable stub
         _G = {},  -- Will be set below
     }
     engine_env._G = engine_env
@@ -152,6 +186,7 @@ local function run_spec_file(spec_path, spec_name)
             end
             return shared_engine
         end,
+        __b5_host_config = _G.__b5_host_config,  -- Mutable stub for B5 tests
 
         -- Test framework functions
         describe = function(name, fn) fn() end,
