@@ -1401,6 +1401,8 @@ local function _newPlayer(modPlayer)
         Id = modPlayer.playerId,
         Name = modPlayer.playerName,
         TaskManager = TaskManager.new(),
+        _ghostFailures = 0,              -- consecutive failed existence probes
+        _ghostFailureTick = nil,          -- tick count of last failure (for dedupe)
     }, Player)
 end
 
@@ -1542,6 +1544,24 @@ function Player:IsInSeat()
     return false
 end
 
+-- Check if the player still exists in the game. Probes the live game
+-- with `tm.players.GetPlayerTransform` to verify the player's character
+-- is present. Returns true if the player is alive in the roster AND has
+-- a character; false otherwise. If the probe throws or is absent, the
+-- player is treated as nonexistent. This is a thin consistency check;
+-- mods should not rely on polling this constantly -- use the
+-- `Players:VerifyExists(id)` service method instead for automatic
+-- failure tracking and ghost detection.
+function Player:Exists()
+    if tm and tm.players and tm.players.GetPlayerTransform then
+        local ok, transform = pcall(tm.players.GetPlayerTransform, self.Id)
+        if ok and transform then
+            return true
+        end
+    end
+    return false
+end
+
 -- Spawn a prefab right next to this player, with an optional Vector3
 -- `offset` from their position. Returns the spawned object so you can
 -- chain calls like `:Scale(2):Rotation(...)` -- not `self`, because
@@ -1579,6 +1599,7 @@ local function _newPlayers()
         _byId = {},                    -- [playerId] = Player
         PlayerJoinedServer = _newSignal("Players.PlayerJoinedServer"),
         PlayerLeftServer = _newSignal("Players.PlayerLeftServer"),
+        PlayerGhosted = _newSignal("Players.PlayerGhosted"),
     }, Players)
 
     -- Internal: turn a Trailmakers player handle into an engine Player
@@ -1645,6 +1666,27 @@ local function _newPlayers()
             end
             pcall(tm.players.OnPlayerLeft.add, self._onLeftBridge)
         end
+    end
+
+    -- Internal: sweep a player from the roster when they are ruled a ghost.
+    -- Fires the PlayerGhosted signal so handlers can react (and still touch
+    -- the player), then destroys the TaskManager and removes the pid from
+    -- _byId. This is idempotent -- if the player is already absent, it is
+    -- a no-op.
+    function self:_ghostSweep(playerId)
+        local p = self._byId[playerId]
+        if not p then
+            return
+        end
+        -- Fire the signal first so handlers can still read and use the
+        -- player before we clean up the TaskManager.
+        self.PlayerGhosted:Fire(p)
+        -- Destroy the player's TaskManager to stop ticking permanently.
+        if p.TaskManager and not p.TaskManager._isDestroyed then
+            pcall(p.TaskManager.Destroy, p.TaskManager)
+        end
+        -- Clear from the roster.
+        self._byId[playerId] = nil
     end
 
     return self
@@ -1725,6 +1767,49 @@ function Players:Iterate()
         i = i + 1
         return snapshot[i]
     end
+end
+
+-- Verify that a player (by id) still exists in the game. Tracks
+-- consecutive failures with same-tick dedupe: if the player fails to
+-- probe within the same tick, it counts as one failure. After 4
+-- consecutive failures, the player is ruled a ghost and swept from the
+-- roster. On any success, the failure counter resets to zero. Returns
+-- true if the player is alive, false if ruled a ghost or not in the
+-- roster. Mods should call this periodically (e.g., in an UpdateService
+-- tick handler) for automatic ghost detection.
+function Players:VerifyExists(playerId)
+    _expectType("Players", "VerifyExists", "playerId", "number", playerId)
+    local p = self._byId[playerId]
+    if not p then
+        return false
+    end
+
+    -- Get the current tick from UpdateService for same-tick dedupe.
+    local currentTick = (_updateServiceInstance and _updateServiceInstance._clock) or 0
+
+    -- Probe the player's existence.
+    local exists = p:Exists()
+
+    if exists then
+        -- Reset the failure counter on success.
+        p._ghostFailures = 0
+        p._ghostFailureTick = nil
+        return true
+    end
+
+    -- Record a failure. Only count it once per tick.
+    if p._ghostFailureTick ~= currentTick then
+        p._ghostFailures = p._ghostFailures + 1
+        p._ghostFailureTick = currentTick
+    end
+
+    -- After 4 consecutive failures, rule the player a ghost.
+    if p._ghostFailures >= 4 then
+        self:_ghostSweep(playerId)
+        return false
+    end
+
+    return false
 end
 
 -- Tell the engine how to build the Players service. It is built lazily,

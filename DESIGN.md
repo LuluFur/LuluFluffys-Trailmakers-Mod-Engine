@@ -310,6 +310,19 @@ Lookup methods on the service:
 - `Players:FindById(id)` returns the player with that host id, or `nil, err`.
 - `Players:Iterate()` returns a stateful iterator function suitable for `for player in Players:Iterate() do` without allocating an intermediate array. Documented for advanced use, not in beginner examples.
 
+Ghost-player detection: A player pid can stay in the roster while their character is gone (e.g., when a nuke + leave crashes the leave event). Any mod running per-player ticks then re-polls a dead pid every frame, feeding Trailmakers' `Failed to find player: N` warning spam and climbing memory usage. The engine provides two tools to detect and clean up this state:
+
+- `Player:Exists()` — roster check plus a pcall'd `tm.players.GetPlayerTransform` probe. Returns true if the player is in the roster and has an active character; false if either check fails. Useful for point-in-time checks, but not recommended for continuous polling.
+- `Players:VerifyExists(id)` — tracks 4 consecutive existence-probe failures with same-tick dedupe. On any probe success, the failure counter resets to zero. After 4 consecutive failures (across different ticks), the player is ruled a ghost and swept from the roster. Mods should call this on a coarse interval (e.g., once per second via `UpdateService:Every(1, ...)`) to get automatic ghost detection without hand-rolling a polling loop.
+
+When a player is ruled a ghost:
+
+- `Players.PlayerGhosted` signal fires, passing the `Player` object. Unlike `PlayerLeftServer`, this signal indicates an unclean state where the character vanished without an event. Handlers can react, clean up, or log for debugging.
+- The player's `TaskManager` is destroyed automatically, which stops any per-player ticking the mod had registered.
+- The pid is removed from the roster (`_byId`), so a late `OnPlayerLeft` event (if it arrives) is a harmless no-op.
+
+The sweep is idempotent and does not throw. The distinction between `PlayerLeftServer` (clean leave) and `PlayerGhosted` (unclean disappearance) lets mods tell the two cases apart and react accordingly.
+
 ### Chat
 
 The chat service has two methods, mapped to two distinct host UI elements. The split is by intent: a panel line attributed to a sender, or an intrusive centre-screen popup.
