@@ -59,6 +59,21 @@ Services are singletons within the single engine instance. Two `:GetService` cal
 
 In examples throughout this document, the engine instance variable is always called `engine`. The full namespace name `LuluFluffysTrailmakersModEngine` is used for namespaced references (`LuluFluffysTrailmakersModEngine.Patterns:Register`, `LuluFluffysTrailmakersModEngine.MarkupText.new`). The short `LFTME` alias appears only at the construction site, because once the instance is in a local variable, the namespace name no longer appears in user code.
 
+### Module loading
+
+Mods that split their code across multiple files use `engine:LoadModules({"core", "tags", ...})` to load them in order. Each name is passed to the host's `tm.os.DoFile` and must return a non-nil value (typically a table containing the module's public interface):
+
+```lua
+local modules = engine:LoadModules({"core", "helpers", "items"})
+local core = modules.core
+local helpers = modules.helpers
+local items = modules.items
+```
+
+Modules must be flat files in `data_static/`. No subfolders. The engine does not discover modules — you must explicitly list them. If any module fails to parse, throws an error, or returns `nil`, a FATAL line is logged through `Logger:Error` and an error broadcast through `Chat:BroadcastToAll` so the failure is visible in-game. Loading then stops — remaining modules are not attempted. The returned value is a table keyed by the module names you passed, in the order you listed them.
+
+Files are loaded synchronously, so you can declare dependencies by listing them in dependency order. If a required module is missing from your list, the loading will fail with a clear error message naming the module that tried to load it.
+
 ## 3. Naming and casing conventions
 
 The engine uses four casing styles, each with a single dedicated role. Mixing them on purpose is how a reader tells public surface from internal state at a glance.

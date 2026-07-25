@@ -3627,6 +3627,47 @@ function LFTME.New()
     return self
 end
 
+-- Load and run a sequence of module files from `data_static/`, in the
+-- given order. Each module is loaded via `tm.os.DoFile` and must return
+-- a non-nil value (typically a table). If any module fails to parse,
+-- throws an error, or returns nothing, a FATAL line is logged, an error
+-- is broadcast to chat, and loading stops -- remaining modules are not
+-- attempted. Returns the table of loaded modules keyed by their names
+-- (as passed in the `names` array).
+--
+-- Modules must be flat files in `data_static/`. No subfolders. The engine
+-- does not discover modules -- you must explicitly list them. Files are
+-- loaded synchronously in the order given, so you can declare dependencies
+-- by listing them in dependency order.
+--
+-- Example:
+--   local modules = engine:LoadModules({"core", "tags", "items"})
+--   print(modules.core, modules.tags, modules.items)
+function Engine:LoadModules(names)
+    _expectType("Engine", "LoadModules", "names", "table", names)
+    local Logger = self:GetService("Logger")
+    local Chat = self:GetService("Chat")
+    local modules = {}
+    for _, name in ipairs(names) do
+        _expectType("Engine", "LoadModules", "names[i]", "string", name)
+        local success, result = pcall(tm.os.DoFile, name .. ".lua")
+        if not success then
+            local msg = "module \"" .. name .. "\" failed to parse: " .. tostring(result)
+            Logger:Error(msg)
+            Chat:BroadcastToAll():Header("Error"):Body("[LoadModules] " .. msg):Duration(10)
+            error(_runtimeError("Engine", "LoadModules", msg), 0)
+        end
+        if result == nil then
+            local msg = "module \"" .. name .. "\" returned nil instead of a module table."
+            Logger:Error(msg)
+            Chat:BroadcastToAll():Header("Error"):Body("[LoadModules] " .. msg):Duration(10)
+            error(_runtimeError("Engine", "LoadModules", msg), 0)
+        end
+        modules[name] = result
+    end
+    return modules
+end
+
 -- Return the existing engine, or `(nil, err)` if `New()` has not been
 -- called yet. Never throws -- safe to call from helper libraries that
 -- do not know whether the engine is up yet.
