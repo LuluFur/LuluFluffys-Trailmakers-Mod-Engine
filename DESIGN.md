@@ -441,16 +441,21 @@ The split between `World`, `ObjectSpawner`, and `Physics` is the engine's main c
 
 `Logger` is the engine's leveled logging service. It writes to a `logs.txt` file in the mod directory, never to the chat panel. The chat panel only renders six lines at a time, so using it for logs would burn the budget for any real player-visible message.
 
-The file backing for Phase 1 is decided as follows. If the host's `tm.os` exposes an append-style write, the logger uses it directly and emits one line per call with negligible memory cost. If only `tm.os.WriteAllText_Dynamic` is available — which is the assumption Phase 1 plans for, because it is the documented host surface — the logger maintains an in-memory line buffer (`Logger._lines`) and rewrites `logs.txt` with `tm.os.WriteAllText_Dynamic(path, table.concat(self._lines, "\n"))` on each emission. The in-memory buffer means a long-running mod's log retention is bounded by available Lua memory and not by disk; mods that log heavily over many hours can exhaust memory if nothing trims the buffer. A future phase may add log rotation, a cap on retained lines, or a streaming sink. Phase 1 deliberately keeps the implementation simple and accepts the memory profile, because the alternative (a custom append shim per host quirk) is more code than it is worth before the host surface stabilises.
+The logger maintains an in-memory ring buffer capped at 200 lines by default. Since Trailmakers only exposes full-file writes (`tm.os.WriteAllText_Dynamic`), the logger cannot append a single line; instead, it maintains the ring buffer in memory and writes the bounded buffer to disk on a throttled schedule (~1 second between writes). Error-level messages bypass the throttle and flush immediately, ensuring the final log line before a crash is never lost.
+
+This design caps memory growth: even a long-running mod that logs thousands of messages over many hours will keep only the most recent 200 lines in memory (tunable via `Logger:SetBufferSize(n)`). The trade-off is that `logs.txt` is not a complete session record — only the last 200 lines are retained. For mods that need more history, `SetBufferSize` can raise the cap; for mods that log lightly, it can be lowered to reduce memory use.
 
 ```lua
 Logger:Debug("scheduler tick")
 Logger:Info("Player123 joined")
 Logger:Warn("prefab resolution fell back to fuzzy match")
 Logger:Error("teleport failed: " .. err)
+Logger:SetBufferSize(500)    -- increase retention to 500 lines
+Logger:SetFlushInterval(2.0) -- throttle writes to every 2 seconds
+Logger:Flush()               -- force a write right now
 ```
 
-The four methods are `Debug`, `Info`, `Warn`, `Error`. Each accepts a single message string and optional formatting arguments. The logger may additionally call `tm.os.Log` for console parity, but `logs.txt` is the source of truth. Engine-internal callback errors (from `Signal` `pcall` isolation) are routed through `Logger:Error` automatically.
+The four logging methods are `Debug`, `Info`, `Warn`, `Error`. Each accepts a single message string and optional formatting arguments. The logger may additionally call `tm.os.Log` for console parity, but `logs.txt` is the source of truth. Engine-internal callback errors (from `Signal` `pcall` isolation) are routed through `Logger:Error` automatically. Public mutators include `SetPath`, `SetMinLevel`, `SetBufferSize`, `SetFlushInterval`, and `Clear`. The `Flush()` method forces an immediate write of the buffer to disk.
 
 ### ModStorage
 

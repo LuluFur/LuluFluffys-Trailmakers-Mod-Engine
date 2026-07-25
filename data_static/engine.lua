@@ -670,13 +670,17 @@ end
 --     local Logger = engine:GetService("Logger")
 --     Logger:Info("hello, world")
 --
--- HEADS UP: Trailmakers only lets us rewrite the whole log file each
--- time, not append a single line, so Logger keeps every line you have
--- logged in memory and rewrites `logs.txt` on every call. For a typical
--- mod this is fine. If your mod runs for hours and logs thousands of
--- messages per minute, you can run out of memory -- consider raising
--- the minimum log level with `Logger:SetMinLevel("Info")` to filter
--- out the noisy Debug lines.
+-- HEADS UP: The in-memory buffer is capped at 200 lines by default
+-- (see `Logger:SetBufferSize`). This means `logs.txt` holds only the
+-- last 200 lines of your session, not the whole session history. For
+-- a long-running session that logs heavily, raise the buffer size with
+-- `Logger:SetBufferSize(n)`, or lower the minimum log level with
+-- `Logger:SetMinLevel("Info")` to filter out Debug noise.
+--
+-- File writes are throttled to ~1 second intervals by default (see
+-- `Logger:SetFlushInterval`). Error-level lines flush immediately to
+-- prevent losing the last log line before a crash. Force a write
+-- anytime with `Logger:Flush()`.
 --
 -- The very first Logger built also gets stashed in `LFTME._logger` so
 -- the engine's internal error paths (like the Signal error catcher
@@ -701,7 +705,12 @@ local DEFAULT_LOG_PATH = "logs.txt"
 local function _newLogger()
     return setmetatable({
         _className = "Logger",
-        _lines = {},
+        _lines = {},        -- the ring buffer (pre-allocated to _bufferSize)
+        _count = 0,         -- number of valid lines in the ring (0.._bufferSize)
+        _pos = 1,           -- next write position (1.._bufferSize)
+        _bufferSize = 200,  -- max lines to keep in memory
+        _flushInterval = 1.0,  -- seconds between file writes
+        _lastFlush = -math.huge,  -- ensure first write always flushes
         _path = DEFAULT_LOG_PATH,
         _minLevel = "Debug",
         _alsoConsole = true,  -- mirror each line to tm.os.Log for console parity
@@ -730,6 +739,46 @@ function Logger:SetMinLevel(level)
     return self
 end
 
+-- Set the maximum number of lines to keep in the in-memory ring buffer.
+-- Older lines are dropped when the buffer fills up. Default is 200.
+-- If you are running a long session and logging heavily, raise this to
+-- retain more history. Calling this method clears the existing buffer.
+function Logger:SetBufferSize(n)
+    _expectType("Logger", "SetBufferSize", "n", "number", n)
+    if n < 1 or n ~= math.floor(n) then
+        error(_runtimeError("Logger", "SetBufferSize",
+            'buffer size must be a positive integer, got ' .. tostring(n)), 0)
+    end
+    self._bufferSize = n
+    self._lines = {}
+    self._count = 0
+    self._pos = 1
+    return self
+end
+
+-- Set the interval (in seconds) between file writes to `logs.txt`.
+-- The logger writes only when (1) the throttle interval has passed,
+-- or (2) an Error-level line is logged (which flushes immediately),
+-- or (3) you call Flush() explicitly. Default is 1.0 second.
+function Logger:SetFlushInterval(interval)
+    _expectType("Logger", "SetFlushInterval", "interval", "number", interval)
+    if interval < 0 then
+        error(_runtimeError("Logger", "SetFlushInterval",
+            'flush interval must be non-negative, got ' .. tostring(interval)), 0)
+    end
+    self._flushInterval = interval
+    return self
+end
+
+-- Internal: get the current time from the game. Returns a valid time if
+-- available, or nil if there is no clock. Used for flush throttling.
+local function _getTime()
+    if tm and tm.os and tm.os.GetTime then
+        return tm.os.GetTime()
+    end
+    return nil
+end
+
 -- Internal: format a message with optional `string.format` args. We
 -- catch formatting errors here (e.g. `%d` paired with a string) and tack
 -- a `[format error: ...]` suffix onto the raw message instead of letting
@@ -750,35 +799,97 @@ end
 -- (seconds since the game started, three decimal places). If we are
 -- running outside the game, the timestamp shows as `?`.
 local function _renderLine(level, body)
-    local t
-    if tm and tm.os and tm.os.GetTime then
-        t = string.format("%.3f", tm.os.GetTime())
+    local t = _getTime()
+    if t then
+        t = string.format("%.3f", t)
     else
         t = "?"
     end
     return "[" .. t .. "] [" .. level .. "] " .. body
 end
 
+-- Internal: write the current ring buffer to disk. If the buffer is
+-- empty, write a single space (since WriteAllText_Dynamic rejects empty
+-- strings). Wrapped in pcall so a disk hiccup never crashes the mod.
+function Logger:_doFlush()
+    if not (tm and tm.os and tm.os.WriteAllText_Dynamic) then
+        return
+    end
+    local content
+    if self._count == 0 then
+        content = " "
+    else
+        -- Build the output in order. If the buffer is not yet full, just
+        -- concatenate positions 1 to _count. If it is full, concatenate
+        -- from _pos (oldest) to _bufferSize, then 1 to _pos-1 (newest).
+        local lines = {}
+        if self._count < self._bufferSize then
+            for i = 1, self._count do
+                table.insert(lines, self._lines[i])
+            end
+        else
+            for i = self._pos, self._bufferSize do
+                table.insert(lines, self._lines[i])
+            end
+            for i = 1, self._pos - 1 do
+                table.insert(lines, self._lines[i])
+            end
+        end
+        content = table.concat(lines, "\n")
+    end
+    pcall(tm.os.WriteAllText_Dynamic, self._path, content)
+    local now = _getTime()
+    if now then
+        self._lastFlush = now
+    end
+end
+
+-- Force a write of the current buffer to disk right now, regardless of
+-- the throttle interval.
+function Logger:Flush()
+    self:_doFlush()
+    return self
+end
+
 -- Internal: write one message at the named level. The four public
 -- methods (`Debug`, `Info`, `Warn`, `Error`) just call this with their
--- own level. The log file is rewritten on every call -- see the section
--- header for why.
+-- own level. Lines are appended to a ring buffer; the file is written
+-- on a throttled schedule (unless the level is Error, which flushes
+-- immediately).
 function Logger:_emit(level, message, ...)
     if _LOG_LEVELS[level] < _LOG_LEVELS[self._minLevel] then
         return
     end
     local line = _renderLine(level, _format(message, ...))
-    table.insert(self._lines, line)
-    -- Rewrite the whole log file. Trailmakers has no "append a line"
-    -- function, so we write the entire buffer every time. Wrapped in a
-    -- safety call so a disk hiccup never crashes the mod.
-    if tm and tm.os and tm.os.WriteAllText_Dynamic then
-        pcall(tm.os.WriteAllText_Dynamic, self._path, table.concat(self._lines, "\n"))
+
+    -- Add line to ring buffer at current position, then advance.
+    self._lines[self._pos] = line
+    if self._count < self._bufferSize then
+        self._count = self._count + 1
     end
+    self._pos = self._pos + 1
+    if self._pos > self._bufferSize then
+        self._pos = 1
+    end
+
     -- Also send the line to the in-game log overlay so you can see it
     -- while playing without alt-tabbing to read the file.
     if self._alsoConsole and tm and tm.os and tm.os.Log then
         pcall(tm.os.Log, line)
+    end
+
+    -- Error-level lines flush immediately. If there is no game clock,
+    -- flush every line (safer than never). Otherwise, throttle to the
+    -- flush interval.
+    if level == "Error" then
+        self:_doFlush()
+    else
+        local now = _getTime()
+        if not now then
+            self:_doFlush()  -- no clock, flush immediately
+        elseif now - self._lastFlush >= self._flushInterval then
+            self:_doFlush()
+        end
     end
 end
 
@@ -797,12 +908,11 @@ function Logger:Warn(message, ...)  self:_emit("Warn",  message, ...) end
 function Logger:Error(message, ...) self:_emit("Error", message, ...) end
 
 -- Throw away every line stored in memory so future log writes start
--- fresh. NOTE: this does not delete the file on disk yet -- the file
--- gets rewritten on the next `Debug/Info/Warn/Error` call. If you want
--- the file empty right now, follow `Clear()` with one quick
--- `Logger:Info("cleared")` to force the rewrite.
+-- fresh. NOTE: this does not delete the file on disk yet. If you want
+-- the file empty right now, follow `Clear()` with `Logger:Flush()`.
 function Logger:Clear()
-    self._lines = {}
+    self._count = 0
+    self._pos = 1
     return self
 end
 
