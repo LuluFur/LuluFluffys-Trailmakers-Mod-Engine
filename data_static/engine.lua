@@ -3631,9 +3631,12 @@ end
 -- given order. Each module is loaded via `tm.os.DoFile` and must return
 -- a non-nil value (typically a table). If any module fails to parse,
 -- throws an error, or returns nothing, a FATAL line is logged, an error
--- is broadcast to chat, and loading stops -- remaining modules are not
--- attempted. Returns the table of loaded modules keyed by their names
--- (as passed in the `names` array).
+-- is broadcast to chat, and the whole LoadModules call ABORTS -- the
+-- caller's code does not resume, and remaining modules are not loaded.
+-- This fail-fast design makes broken module chains impossible to ignore.
+-- If the host's `tm.os.DoFile` is not available (some test harnesses,
+-- some Trailmakers builds), LoadModules returns an empty table and logs
+-- a warning -- it does not crash.
 --
 -- Modules must be flat files in `data_static/`. No subfolders. The engine
 -- does not discover modules -- you must explicitly list them. Files are
@@ -3648,6 +3651,11 @@ function Engine:LoadModules(names)
     local Logger = self:GetService("Logger")
     local Chat = self:GetService("Chat")
     local modules = {}
+    -- Guard against absent tm.os.DoFile (some Trailmakers builds or test harnesses)
+    if not (tm and tm.os and tm.os.DoFile) then
+        Logger:Warn("LoadModules: host tm.os.DoFile not available; no modules loaded.")
+        return modules
+    end
     for _, name in ipairs(names) do
         _expectType("Engine", "LoadModules", "names[i]", "string", name)
         local success, result = pcall(tm.os.DoFile, name .. ".lua")
