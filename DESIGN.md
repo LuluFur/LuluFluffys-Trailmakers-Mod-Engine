@@ -312,8 +312,8 @@ Lookup methods on the service:
 
 Ghost-player detection: A player pid can stay in the roster while their character is gone (e.g., when a nuke + leave crashes the leave event). Any mod running per-player ticks then re-polls a dead pid every frame, feeding Trailmakers' `Failed to find player: N` warning spam and climbing memory usage. The engine provides two tools to detect and clean up this state:
 
-- `Player:Exists()` — roster check plus a pcall'd `tm.players.GetPlayerTransform` probe. Returns true if the player is in the roster and has an active character; false if either check fails. Useful for point-in-time checks, but not recommended for continuous polling.
-- `Players:VerifyExists(id)` — tracks 4 consecutive existence-probe failures with same-tick dedupe. On any probe success, the failure counter resets to zero. After 4 consecutive failures (across different ticks), the player is ruled a ghost and swept from the roster. Mods should call this on a coarse interval (e.g., once per second via `UpdateService:Every(1, ...)`) to get automatic ghost detection without hand-rolling a polling loop.
+- `Player:Exists()` — Probes character existence via `tm.players.GetPlayerTransform`. Returns three values: `exists` (boolean, true only if probe succeeded), `canProbe` (boolean, false only if host function is absent), and `error` (string/nil, non-nil only if probe threw). When `canProbe` is false, existence is unknown and the player is treated as alive — missing evidence is not death. Useful for point-in-time checks when you hold a Player object.
+- `Players:VerifyExists(id)` — Continuous ghost detection with automatic periodic sweep. The engine runs this automatically every 1 second via `UpdateService:Every`, checking all players and sweeping any that have failed 4 consecutive probes (across different ticks). Failure counter resets to zero on any probe success. Same-tick dedupe prevents multiple calls in one tick from accumulating; missing probe (canProbe=false) resets failures to 0. Mods can call this on-demand for immediate checks, but do not need to hand-roll a polling loop.
 
 When a player is ruled a ghost:
 
