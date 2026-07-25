@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  luajit-parse:
+    name: LuaJIT parse gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit
+
+      - name: Parse engine.lua
+        run: luajit -b data_static/engine.lua /dev/null
+
+      - name: Parse main.lua
+        run: luajit -b main.lua /dev/null
+
+  specs:
+    name: LuaJIT spec suite
+    runs-on: ubuntu-latest
+    needs: luajit-parse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luajit
+
+      # tests/run.lua exits non-zero when any spec fails, which fails the
+      # job on its own. No extra guard step is needed.
+      - name: Run specs
+        run: luajit tests/run.lua
+
+  leak-lint:
+    name: Per-player table leak scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Non-blocking: the table registry this is meant to check against
+      # (issue #23) does not exist yet, so this reports rather than gates.
+      - name: Run leak-lint (non-blocking)
+        run: bash scripts/leak_lint.sh
+        continue-on-error: true
+
+      - name: Report findings
+        if: always()
+        run: |
+          if [ -f leak-lint-report.txt ]; then
+            echo "Leak lint report:"
+            cat leak-lint-report.txt
+          fi
