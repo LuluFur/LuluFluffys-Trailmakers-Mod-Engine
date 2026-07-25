@@ -63,7 +63,7 @@ In examples throughout this document, the engine instance variable is always cal
 
 The engine uses four casing styles, each with a single dedicated role. Mixing them on purpose is how a reader tells public surface from internal state at a glance.
 
-`PascalCase` is the public surface. Services (`Players`, `Chat`, `ObjectSpawner`), classes (`Signal`, `Connection`, `TaskManager`, `Player`), public methods (`SendMessageTo`, `BroadcastToAll`, `Teleport`, `Kick`), public properties (`Name`, `Id`, `Connected`), and signal names (`PlayerJoinedServer`, `MessageReceived`) are all PascalCase. Constructors are `.new` on data types (`Vector3.new`, `Color3.fromRGB`, `MarkupText.new`) to match Roblox idiom.
+`PascalCase` is the public surface. Services (`Players`, `Chat`, `ObjectSpawner`), classes (`Signal`, `Connection`, `TaskManager`, `Player`), public methods (`SendMessage`, `BroadcastToAll`, `Teleport`, `Kick`), public properties (`Name`, `Id`, `Connected`), and signal names (`PlayerJoinedServer`, `MessageReceived`) are all PascalCase. Constructors are `.new` on data types (`Vector3.new`, `Color3.fromRGB`, `MarkupText.new`) to match Roblox idiom.
 
 `camelCase` is local variable names, function parameters, and short-lived scratch values inside method bodies:
 
@@ -177,7 +177,7 @@ Player:Teleport(main.lua:123) expected Vector3 for parameter "position", got str
 ```
 
 ```text
-Chat:SendMessageTo(main.lua:45) expected Player for parameter "player", got nil
+Chat:SendMessage(main.lua:45) expected string for parameter "message", got nil
 ```
 
 ```text
@@ -269,7 +269,7 @@ Raw HTML-style tags are always accepted by `Chat:BroadcastToAll`, so the builder
 Chat:BroadcastToAll("Alert", "<b>Server</b> restarting")
 ```
 
-works without any builder involvement. Chat panel lines (`Chat:SendMessageTo`) do not support formatting tags — the host renders them as plain text — and the engine documents this rather than silently stripping or converting.
+works without any builder involvement. Chat panel lines (`Chat:SendMessage`) do not support formatting tags — the host renders them as plain text — and the engine documents this rather than silently stripping or converting.
 
 Because intrusive popups pass tags through, any user-supplied substring — most commonly a player name — is interpolated raw and may produce accidental formatting if it happens to contain markup-like characters. The engine ships a small escape helper for the common case:
 
@@ -315,10 +315,12 @@ Lookup methods on the service:
 The chat service has two methods, mapped to two distinct host UI elements. The split is by intent: a panel line attributed to a sender, or an intrusive centre-screen popup.
 
 ```lua
-Chat:SendMessageTo(player, "Welcome!")
+Chat:SendMessage("Welcome!")
 ```
 
-calls `tm.playerUI.SendChatMessage` under the hood and produces a chat-panel line. The host quirk that `SendChatMessage` is technically broadcast-attributed-to-sender is hidden — the caller does not need to know. The chat panel renders at most six lines at a time; older lines are dropped as new ones arrive. Mods should treat chat as ephemeral and lossy rather than as a transcript.
+calls `tm.playerUI.SendChatMessage` under the hood and produces a chat-panel line. Trailmakers has no per-player chat surface: `SendChatMessage` always broadcasts, attributed to the configured sender name. The engine states that in the signature rather than hiding it — `SendMessage` takes only the message, so it cannot imply a targeting that the host does not provide. The chat panel renders at most six lines at a time; older lines are dropped as new ones arrive. Mods should treat chat as ephemeral and lossy rather than as a transcript.
+
+`Chat:SendMessageTo(player, message)` is the older name for the same call and still works, but it is **deprecated**. It accepted a `player` argument it could never honour, which led callers to loop over players and send N copies of every line. It now drops the `player` argument, logs a one-shot deprecation warning, and forwards to `SendMessage`. Existing mods keep running unchanged; new code should use `SendMessage`.
 
 ```lua
 Chat:BroadcastToAll("Warning", "Server restarting in 10 seconds")
@@ -340,7 +342,7 @@ Chat.MessageReceived:Connect(function(player, msg)
 end)
 ```
 
-Echo suppression is built in. The host's `OnChatMessage` callback fires for messages the engine itself sent via `SendChatMessage`, which would otherwise produce a feedback loop. The engine maintains an internal TTL-keyed `_echoMap` so user code never sees the echo. This is one of the principal pain points the engine absorbs.
+Echo suppression is built in. The host's `OnChatMessage` callback fires for messages the engine itself sent via `SendChatMessage`, which would otherwise produce a feedback loop. The engine maintains an internal `_echoMap` so user code never sees the echo. It counts rather than flags: each outbound send bumps a per-(sender, message) counter, and each matching inbound line consumes one count, so exactly as many copies as the engine sent are suppressed. A player who happens to type the same text as a recent server message is still delivered. The TTL on each entry exists only to discard counts whose echo never arrived. This is one of the principal pain points the engine absorbs.
 
 ### ObjectSpawner
 
@@ -847,7 +849,7 @@ The Phase 1 deliverables are:
 - `Vector3` and `Color3` data types, with the operations listed in section 5.
 - `MarkupText` chainable builder reachable as `LuluFluffysTrailmakersModEngine.MarkupText`.
 - `Players` service with `PlayerJoinedServer`, `PlayerLeftServer`, `GetPlayers`, `FindByName`, `FindById`, `Iterate`. `Player` objects with `Name`, `Id`, `TaskManager`, `Teleport`, `Kick`, `Kill`, `Eject`, `SetTeam`, `SetInvincible`, `SetJetpackEnabled`, `SpawnObjectNearby`, `GetPosition`, `IsInSeat`.
-- `Chat` service with `SendMessageTo`, `BroadcastToAll` (positional and chainable builder forms), and the `MessageReceived` signal. Echo suppression hidden inside the wrapper. Six-line chat panel cap documented. HTML-style tags accepted only on intrusive popups.
+- `Chat` service with `SendMessage` (plus the deprecated `SendMessageTo` alias), `BroadcastToAll` (positional and chainable builder forms), and the `MessageReceived` signal. Echo suppression hidden inside the wrapper. Six-line chat panel cap documented. HTML-style tags accepted only on intrusive popups.
 - `ObjectSpawner` service with `SpawnObject`, `SpawnGroup`, `ResolvePrefab`, and the fuzzy resolution order from section 6. Built-in patterns: `Circle`, `Ring`, `Grid`, `Cube`, `Sphere`, `Line`, `Wall`. Custom pattern registration via `LuluFluffysTrailmakersModEngine.Patterns:Register`. Optional `engine.Settings.WarnOnRawPrefabStrings`.
 - `World` service with gravity, time scale, time of day, wind, and map name accessors.
 - `Logger` service writing to `logs.txt` via `tm.os.WriteAllText_Dynamic`, with `Debug`, `Info`, `Warn`, `Error` methods. Engine-internal callback errors routed through `Logger:Error`.
@@ -904,7 +906,7 @@ Chat.MessageReceived:Connect(function(player, msg)
 end)
 ```
 
-The chat handler is intentionally minimal. It matches a literal command string and calls `player:Kick(reason)`. The mutator-returns-self rule applies — `Kick` returns `self` — but the chain terminates here because there is nothing else to chain on a player that is being kicked. Note that the `MessageReceived` signal handler does not see the engine's own `Chat:SendMessageTo` calls: echo suppression in the chat service eats them so user code does not have to.
+The chat handler is intentionally minimal. It matches a literal command string and calls `player:Kick(reason)`. The mutator-returns-self rule applies — `Kick` returns `self` — but the chain terminates here because there is nothing else to chain on a player that is being kicked. Note that the `MessageReceived` signal handler does not see the engine's own `Chat:SendMessage` calls: echo suppression in the chat service eats them so user code does not have to.
 
 ```lua
 local elapsed = 0
@@ -923,11 +925,13 @@ That is the entire mod. There is no boilerplate cleanup, no `tm.*` call, no manu
 
 ## Appendix B: Boundary rule — service versus player object
 
-The split between methods on a service and methods on a player object is worth restating because it shows up in nearly every API discussion. Methods on a service (`Chat:SendMessageTo`, `Players:FindByName`, `ObjectSpawner:SpawnObject`) represent the engine acting on the world or the caller asking the engine for information. Methods on a player object (`player:Kick`, `player:Teleport`, `player:GetPosition`) represent the player as the actor or the data source.
+The split between methods on a service and methods on a player object is worth restating because it shows up in nearly every API discussion. Methods on a service (`Chat:SendMessage`, `Players:FindByName`, `ObjectSpawner:SpawnObject`) represent the engine acting on the world or the caller asking the engine for information. Methods on a player object (`player:Kick`, `player:Teleport`, `player:GetPosition`) represent the player as the actor or the data source.
 
 The rule shapes API design in two places. First, inbound chat fires on the service (`Chat.MessageReceived`), not on the player object, because `player.MessageReceived` would read as "the player has a message received event" — which they do not; the chat panel does. Second, the spawn API is on `ObjectSpawner` rather than on the player even when spawning happens near a player, because the actor is the engine, not the player.
 
-The same reasoning is why `player:SendChatMessage(text)` would be wrong. It would suggest the player is doing the chatting, when in fact the engine is sending a chat panel line attributed to that player. The actual API is `Chat:SendMessageTo(player, text)` — the engine is the actor, the player is the target.
+The same reasoning is why `player:SendChatMessage(text)` would be wrong. It would suggest the player is doing the chatting, when in fact the engine is sending a chat panel line attributed to the configured sender name. The actual API is `Chat:SendMessage(text)` — the engine is the actor and the chat panel is the surface.
+
+There is no player on either side of that call, and that is the second half of the rule: a parameter should only exist if the host can honour it. The deprecated `Chat:SendMessageTo(player, text)` took a `player` argument purely because the shape looked symmetrical with the rest of the API, but Trailmakers only broadcasts, so the argument was decorative. A parameter the engine silently ignores is worse than no parameter at all — it teaches callers a targeting model that does not exist.
 
 ## Appendix C: Settings table
 

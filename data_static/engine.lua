@@ -978,7 +978,15 @@ function UpdateService:_pump(dt)
                 -- as dead. We treat that as a normal end-of-life rather
                 -- than an error -- finished tasks are fine to silently
                 -- skip.
-                if coroutine.status(co) ~= "dead" then
+                --
+                -- Defence-in-depth: re-check Cancelled here as well as
+                -- in the outer loop. A previous entry processed in this
+                -- same tick may have cancelled this entry's handle via
+                -- a side effect (e.g. another task calling h:Cancel()
+                -- on the handle that owns the current coroutine).
+                if entry.handle and entry.handle.Cancelled then
+                    -- handle was cancelled mid-tick; drop without resume
+                elseif coroutine.status(co) ~= "dead" then
                     local ok, err = coroutine.resume(co)
                     if not ok then
                         _logSchedulerError("task.spawn coroutine error: " .. tostring(err))
@@ -1007,10 +1015,15 @@ function UpdateService:_pump(dt)
     end
 
     -- Carry over anything that was added during this tick (those live
-    -- past the original end of the list right now).
+    -- past the original end of the list right now). Skip carry-overs
+    -- whose handle was cancelled mid-tick so cancellation latency is
+    -- exactly one pump tick instead of two.
     local total = #self._queue
     for i = count + 1, total do
-        keep[#keep + 1] = self._queue[i]
+        local carry = self._queue[i]
+        if not (carry.handle and carry.handle.Cancelled) then
+            keep[#keep + 1] = carry
+        end
     end
 
     self._queue = keep
@@ -1740,10 +1753,13 @@ end)
 -- The Chat service covers TWO different on-screen surfaces in
 -- Trailmakers, with one method each:
 --
---   * Chat:SendMessageTo(player, message)
+--   * Chat:SendMessage(message)
 --       A normal chat line in the chat panel. By default it appears
 --       to come from "Server" -- change that with
---       `Chat:SetSenderName("...")`.
+--       `Chat:SetSenderName("...")`. (Trailmakers' chat API can only
+--       broadcast, so every player sees the line. The older name
+--       `SendMessageTo(player, message)` is kept as a deprecated alias
+--       that drops the `player` arg and warns once.)
 --
 --   * Chat:BroadcastToAll(header, body, duration?)
 --       A big middle-of-screen popup that EVERY player sees. There is
@@ -1877,7 +1893,18 @@ local function _newChat(playersService)
     local self = setmetatable({
         _className = "Chat",
         _senderName = DEFAULT_SENDER_NAME,
-        _echoMap = {},                 -- [senderName..NUL..message] = expiry clock
+        -- Echo suppression uses a per-(sender, message) counter rather
+        -- than a TTL+last-write-wins flag. Each outbound send bumps the
+        -- counter; each matching inbound chat consumes one count. This
+        -- avoids dropping a legitimate player message that happens to
+        -- match a recently-sent server message: only as many inbound
+        -- copies as we sent are suppressed.
+        --
+        -- Shape: _echoMap[key] = { count = N, expiry = clock + TTL }
+        -- expiry exists only to garbage-collect entries the host never
+        -- echoes back (offline, future API change). Counts at zero are
+        -- removed eagerly.
+        _echoMap = {},
         _playersService = playersService,
         MessageReceived = _newSignal("Chat.MessageReceived"),
     }, Chat)
@@ -1892,10 +1919,17 @@ local function _newChat(playersService)
             -- loops.
             local now = (_updateServiceInstance and _updateServiceInstance._clock) or 0
             local key = tostring(senderName) .. "\0" .. tostring(message)
-            local expiry = self._echoMap[key]
-            if expiry and expiry > now then
-                self._echoMap[key] = nil
+            local entry = self._echoMap[key]
+            if entry and entry.expiry > now and entry.count > 0 then
+                entry.count = entry.count - 1
+                if entry.count <= 0 then
+                    self._echoMap[key] = nil
+                end
                 return
+            elseif entry and entry.expiry <= now then
+                -- stale entry whose echo never arrived; drop it so it
+                -- cannot suppress a future genuine player message
+                self._echoMap[key] = nil
             end
             -- Try to look the sender up as a Player. `FindByName`
             -- returns `(nil, err)` if it cannot match a name; we just
@@ -1927,24 +1961,52 @@ end
 
 -- Send a chat line that every player will see in their chat panel.
 -- It will be shown as if it came from the sender name you configured
--- (default "Server"; change with `Chat:SetSenderName`). The `player`
--- argument is currently mostly ceremonial -- Trailmakers' chat API only
--- supports broadcasting, so the message goes to everyone regardless.
--- We accept it now so a future per-player chat API can drop in cleanly.
--- The engine notes the (sender, message) pair for a moment so the
--- inbound chat handler can drop Trailmakers' own self-echo. Returns
--- self for chaining (wraps `tm.playerUI.SendChatMessage`).
-function Chat:SendMessageTo(player, message)
-    _expectInstance("Chat", "SendMessageTo", "player", "Player", player)
-    _expectType("Chat", "SendMessageTo", "message", "string", message)
+-- (default "Server"; change with `Chat:SetSenderName`). Trailmakers'
+-- chat API can only broadcast -- there is no per-player chat surface,
+-- so a single send reaches everyone. The engine notes the (sender,
+-- message) pair for a moment so the inbound chat handler can drop
+-- Trailmakers' own self-echo. Returns self for chaining (wraps
+-- `tm.playerUI.SendChatMessage`).
+function Chat:SendMessage(message)
+    _expectType("Chat", "SendMessage", "message", "string", message)
     local senderName = self._senderName
     local now = (_updateServiceInstance and _updateServiceInstance._clock) or 0
     local key = senderName .. "\0" .. message
-    self._echoMap[key] = now + ECHO_SUPPRESSION_TTL
+    local entry = self._echoMap[key]
+    if entry and entry.expiry > now then
+        entry.count = entry.count + 1
+        entry.expiry = now + ECHO_SUPPRESSION_TTL
+    else
+        self._echoMap[key] = { count = 1, expiry = now + ECHO_SUPPRESSION_TTL }
+    end
     if tm and tm.playerUI and tm.playerUI.SendChatMessage then
         pcall(tm.playerUI.SendChatMessage, senderName, message)
     end
     return self
+end
+
+-- Deprecated. Older name that took a `player` argument it could not
+-- honour -- Trailmakers' chat API only broadcasts. The `player` arg is
+-- dropped and the call is forwarded to `Chat:SendMessage(message)`.
+-- The first call per Chat instance logs a one-shot warning so mods
+-- migrate; subsequent calls forward silently. Will be removed in a
+-- future engine version.
+function Chat:SendMessageTo(player, message)
+    _expectInstance("Chat", "SendMessageTo", "player", "Player", player)
+    _expectType("Chat", "SendMessageTo", "message", "string", message)
+    if not self._sendMessageToWarned then
+        self._sendMessageToWarned = true
+        local logger = LFTME._logger
+        if logger and logger.Warn then
+            pcall(logger.Warn, logger,
+                "[Chat:SendMessageTo] deprecated; use Chat:SendMessage(message). " ..
+                "The `player` argument was never honoured -- Trailmakers' chat API broadcasts.")
+        elseif tm and tm.os and tm.os.Log then
+            pcall(tm.os.Log,
+                "[LFTME] Chat:SendMessageTo deprecated; use Chat:SendMessage(message).")
+        end
+    end
+    return self:SendMessage(message)
 end
 
 -- Show a big middle-of-screen popup to every player. Two ways to call:
@@ -2238,7 +2300,49 @@ end)
 -- Same style rules as the rest of the engine: every Trailmakers call is
 -- wrapped in a safety net, every argument is type-checked, errors use
 -- the same prefix format pointing back at your code.
+--
+-- ERROR MODEL FOR MUTATORS (B5):
+-- Set*/mutator methods in this section wrap their host call with
+-- `_hostCallWarn(service, method, hostFn, ...)` instead of a bare
+-- `pcall`. On host-call failure the helper routes the error string
+-- through `LFTME._logger:Warn` (falling back to `tm.os.Log` if no
+-- Logger is constructed yet) before returning. The method still
+-- returns `self` so chaining is not broken, but the failure is no
+-- longer silent -- mods see a warning in their log instead of a
+-- mysteriously no-op `World:SetGravity(...)`. Query/getter methods
+-- keep their existing `local ok, value = pcall(...)` style because
+-- they need to propagate the value on success. Logger internals and
+-- init-time event-handler registration deliberately keep the bare
+-- `pcall` to avoid recursion and startup-order coupling.
 --------------------------------------------------------------------------------
+
+-- Internal: wrap a host (`tm.*`) call so failures are surfaced through
+-- the engine logger instead of silently discarded. Used by every
+-- mutator/Set* method in this section so the engine has one consistent
+-- error story for host-call failures.
+--
+-- Returns the underlying `pcall` tuple (ok, result_or_err) so the
+-- caller can branch on success if it cares, but most mutators just
+-- discard it and `return self`.
+local function _hostCallWarn(service, method, hostFn, ...)
+    if hostFn == nil then
+        return true, nil
+    end
+    local ok, err = pcall(hostFn, ...)
+    if not ok then
+        local logger = LFTME._logger
+        local label = "[" .. tostring(service) .. ":" .. tostring(method) .. "]"
+        if logger and logger.Warn then
+            pcall(logger.Warn, logger,
+                label .. " host call failed: " .. tostring(err))
+        elseif tm and tm.os and tm.os.Log then
+            pcall(tm.os.Log,
+                "[LFTME] " .. label .. " host call failed: " .. tostring(err))
+        end
+    end
+    return ok, err
+end
+
 
 -- A small JSON encoder/decoder used by ModStorage so your mod can save
 -- and load tables as files. You usually do not call `_json.*` directly;
@@ -2307,10 +2411,34 @@ local function _jsonEncodeValue(v, seen)
             seen[v] = nil
             return "[" .. table.concat(parts, ",") .. "]"
         else
+            -- Object branch. JSON keys must be strings. We coerce
+            -- numeric keys to their string form (matching JavaScript's
+            -- JSON.stringify: `{[2]="a"}` -> `{"2":"a"}`). Previously
+            -- non-string keys were silently dropped, which caused
+            -- ModStorage:WriteJSON to lose data without warning. Bool,
+            -- table, and function keys are still rejected with an
+            -- explicit error rather than silent loss.
             local parts = {}
             for k, val in pairs(v) do
-                if type(k) == "string" then
+                local kt = type(k)
+                if kt == "string" then
                     parts[#parts+1] = _jsonEncodeString(k) .. ":" .. _jsonEncodeValue(val, seen)
+                elseif kt == "number" then
+                    if k ~= k or k == math.huge or k == -math.huge then
+                        error(_runtimeError("ModStorage", "Encode",
+                            "cannot encode table with NaN or +/-inf key."), 0)
+                    end
+                    local keyStr
+                    if k == math.floor(k) and math.abs(k) < 1e15 then
+                        keyStr = string.format("%d", k)
+                    else
+                        keyStr = string.format("%.17g", k)
+                    end
+                    parts[#parts+1] = _jsonEncodeString(keyStr) .. ":" .. _jsonEncodeValue(val, seen)
+                else
+                    error(_runtimeError("ModStorage", "Encode",
+                        "cannot encode table with key of type " .. kt ..
+                        " (only string and number keys are supported)."), 0)
                 end
             end
             seen[v] = nil
@@ -2508,7 +2636,7 @@ function ModStorage:Write(path, contents)
     _expectType("ModStorage", "Write", "path", "string", path)
     _expectType("ModStorage", "Write", "contents", "string", contents)
     if tm and tm.os and tm.os.WriteAllText_Dynamic then
-        pcall(tm.os.WriteAllText_Dynamic, path, contents)
+        _hostCallWarn("ModStorage", "Write", tm.os.WriteAllText_Dynamic, path, contents)
     end
     return self
 end
@@ -2615,7 +2743,7 @@ function World:SetTimeOfDay(t)
             "value " .. tostring(t) .. " is out of range [0, 100]."), 0)
     end
     if tm and tm.world and tm.world.SetTimeOfDay then
-        pcall(tm.world.SetTimeOfDay, t)
+        _hostCallWarn("World", "SetTimeOfDay", tm.world.SetTimeOfDay, t)
     end
     return self
 end
@@ -2627,7 +2755,7 @@ end
 function World:SetTimeOfDayPaused(paused)
     _expectType("World", "SetTimeOfDayPaused", "paused", "boolean", paused)
     if tm and tm.world and tm.world.SetPausedTimeOfDay then
-        pcall(tm.world.SetPausedTimeOfDay, paused)
+        _hostCallWarn("World", "SetTimeOfDayPaused", tm.world.SetPausedTimeOfDay, paused)
     end
     return self
 end
@@ -2653,7 +2781,7 @@ end
 function World:SetGravity(multiplier)
     _expectType("World", "SetGravity", "multiplier", "number", multiplier)
     if tm and tm.physics and tm.physics.SetGravityMultiplier then
-        pcall(tm.physics.SetGravityMultiplier, multiplier)
+        _hostCallWarn("World", "SetGravity", tm.physics.SetGravityMultiplier, multiplier)
     end
     return self
 end
@@ -2676,7 +2804,7 @@ end
 function World:SetTimeScale(scale)
     _expectType("World", "SetTimeScale", "scale", "number", scale)
     if tm and tm.physics and tm.physics.SetTimeScale then
-        pcall(tm.physics.SetTimeScale, scale)
+        _hostCallWarn("World", "SetTimeScale", tm.physics.SetTimeScale, scale)
     end
     return self
 end
@@ -2697,7 +2825,7 @@ function World:SetGlobalWind(a, b, c)
             "Vector3 or (x, y, z) numbers", a)
     end
     if tm and tm.world and tm.world.SetGlobalWind then
-        pcall(tm.world.SetGlobalWind, _makeHostVec3(x, y, z))
+        _hostCallWarn("World", "SetGlobalWind", tm.world.SetGlobalWind, _makeHostVec3(x, y, z))
     end
     return self
 end
@@ -2722,7 +2850,7 @@ end
 function World:SetBuildComplexity(n)
     _expectType("World", "SetBuildComplexity", "n", "number", n)
     if tm and tm.physics and tm.physics.SetBuildComplexity then
-        pcall(tm.physics.SetBuildComplexity, n)
+        _hostCallWarn("World", "SetBuildComplexity", tm.physics.SetBuildComplexity, n)
     end
     return self
 end
@@ -2771,7 +2899,7 @@ function UI:AddLabel(player, key, text)
     _expectType("UI", "AddLabel", "key", "string", key)
     _expectType("UI", "AddLabel", "text", "string", text)
     if tm and tm.playerUI and tm.playerUI.AddUILabel then
-        pcall(tm.playerUI.AddUILabel, id, key, text)
+        _hostCallWarn("UI", "AddLabel", tm.playerUI.AddUILabel, id, key, text)
     end
     return self
 end
@@ -2791,7 +2919,7 @@ end
 function UI:ClearLabels(player)
     local id = _uiPlayerId("ClearLabels", player)
     if tm and tm.playerUI and tm.playerUI.ClearUI then
-        pcall(tm.playerUI.ClearUI, id)
+        _hostCallWarn("UI", "ClearLabels", tm.playerUI.ClearUI, id)
     end
     return self
 end
@@ -2808,7 +2936,7 @@ function UI:ShowIntrusive(title, body, duration)
         _expectType("UI", "ShowIntrusive", "duration", "number", duration)
     end
     if tm and tm.playerUI and tm.playerUI.ShowIntrusiveMessageForAllPlayers then
-        pcall(tm.playerUI.ShowIntrusiveMessageForAllPlayers, title, body, duration or 5)
+        _hostCallWarn("UI", "ShowIntrusive", tm.playerUI.ShowIntrusiveMessageForAllPlayers, title, body, duration or 5)
     end
     return self
 end
@@ -2825,7 +2953,7 @@ function UI:ShowSubtle(title, body, duration)
         _expectType("UI", "ShowSubtle", "duration", "number", duration)
     end
     if tm and tm.playerUI and tm.playerUI.AddSubtleMessageForAllPlayers then
-        pcall(tm.playerUI.AddSubtleMessageForAllPlayers, title, body, duration or 5)
+        _hostCallWarn("UI", "ShowSubtle", tm.playerUI.AddSubtleMessageForAllPlayers, title, body, duration or 5)
     end
     return self
 end
@@ -2863,7 +2991,7 @@ function Audio:PlayAtPosition(position, name)
     _expectInstance("Audio", "PlayAtPosition", "position", "Vector3", position)
     _expectType("Audio", "PlayAtPosition", "name", "string", name)
     if tm and tm.audio and tm.audio.PlayAudioAtPosition then
-        pcall(tm.audio.PlayAudioAtPosition,
+        _hostCallWarn("Audio", "PlayAtPosition", tm.audio.PlayAudioAtPosition,
             _makeHostVec3(position.X, position.Y, position.Z), name)
     end
     return self
@@ -2882,7 +3010,7 @@ end)
 -- (wraps `tm.players.TeleportPlayerToSpawnPoint`).
 function Player:TeleportToSpawn()
     if tm and tm.players and tm.players.TeleportPlayerToSpawnPoint then
-        pcall(tm.players.TeleportPlayerToSpawnPoint, self.Id)
+        _hostCallWarn("Player", "TeleportToSpawn", tm.players.TeleportPlayerToSpawnPoint, self.Id)
     end
     return self
 end
@@ -2894,7 +3022,7 @@ end
 function Player:SetBuilderEnabled(enabled)
     _expectType("Player", "SetBuilderEnabled", "enabled", "boolean", enabled)
     if tm and tm.players and tm.players.SetBuilderEnabled then
-        pcall(tm.players.SetBuilderEnabled, self.Id, enabled)
+        _hostCallWarn("Player", "SetBuilderEnabled", tm.players.SetBuilderEnabled, self.Id, enabled)
     end
     return self
 end
@@ -2905,7 +3033,7 @@ end
 function Player:SetRepairEnabled(enabled)
     _expectType("Player", "SetRepairEnabled", "enabled", "boolean", enabled)
     if tm and tm.players and tm.players.SetRepairEnabled then
-        pcall(tm.players.SetRepairEnabled, self.Id, enabled)
+        _hostCallWarn("Player", "SetRepairEnabled", tm.players.SetRepairEnabled, self.Id, enabled)
     end
     return self
 end
@@ -3013,7 +3141,7 @@ end
 -- props. Returns self for chaining (wraps `tm.physics.ClearAllSpawns`).
 function ObjectSpawner:ClearAllSpawns()
     if tm and tm.physics and tm.physics.ClearAllSpawns then
-        pcall(tm.physics.ClearAllSpawns)
+        _hostCallWarn("ObjectSpawner", "ClearAllSpawns", tm.physics.ClearAllSpawns)
     end
     return self
 end
@@ -3027,7 +3155,7 @@ function ObjectSpawner:AddMesh(name, data)
     _expectType("ObjectSpawner", "AddMesh", "name", "string", name)
     _expectType("ObjectSpawner", "AddMesh", "data", "string", data)
     if tm and tm.physics and tm.physics.AddMesh then
-        pcall(tm.physics.AddMesh, name, data)
+        _hostCallWarn("ObjectSpawner", "AddMesh", tm.physics.AddMesh, name, data)
     end
     return self
 end
@@ -3040,7 +3168,7 @@ function ObjectSpawner:AddTexture(name, data)
     _expectType("ObjectSpawner", "AddTexture", "name", "string", name)
     _expectType("ObjectSpawner", "AddTexture", "data", "string", data)
     if tm and tm.physics and tm.physics.AddTexture then
-        pcall(tm.physics.AddTexture, name, data)
+        _hostCallWarn("ObjectSpawner", "AddTexture", tm.physics.AddTexture, name, data)
     end
     return self
 end
@@ -3086,7 +3214,7 @@ function UpdateService:SetTargetDelta(dt)
             "delta must be positive; got " .. tostring(dt) .. "."), 0)
     end
     if tm and tm.os and tm.os.SetModTargetDeltaTime then
-        pcall(tm.os.SetModTargetDeltaTime, dt)
+        _hostCallWarn("UpdateService", "SetTargetDelta", tm.os.SetModTargetDeltaTime, dt)
     end
     return self
 end
@@ -3153,7 +3281,7 @@ end
 function Player:SetBlockLimit(n)
     _expectType("Player", "SetBlockLimit", "n", "number", n)
     if tm and tm.players and tm.players.SetBlockLimit then
-        pcall(tm.players.SetBlockLimit, self.Id, n)
+        _hostCallWarn("Player", "SetBlockLimit", tm.players.SetBlockLimit, self.Id, n)
     end
     return self
 end
@@ -3165,10 +3293,10 @@ end
 function Player:SetSpawnPoint(position)
     _expectInstance("Player", "SetSpawnPoint", "position", "Vector3", position)
     if tm and tm.players and tm.players.SetPlayerSpawnLocation then
-        pcall(tm.players.SetPlayerSpawnLocation, self.Id,
+        _hostCallWarn("Player", "SetSpawnPoint", tm.players.SetPlayerSpawnLocation, self.Id,
             _makeHostVec3(position.X, position.Y, position.Z))
     elseif tm and tm.players and tm.players.SetSpawnPoint then
-        pcall(tm.players.SetSpawnPoint, self.Id,
+        _hostCallWarn("Player", "SetSpawnPoint", tm.players.SetSpawnPoint, self.Id,
             _makeHostVec3(position.X, position.Y, position.Z))
     end
     return self
@@ -3181,7 +3309,7 @@ end
 function Players:SetGlobalSpawnPoint(position)
     _expectInstance("Players", "SetGlobalSpawnPoint", "position", "Vector3", position)
     if tm and tm.players and tm.players.SetSpawnPoint then
-        pcall(tm.players.SetSpawnPoint,
+        _hostCallWarn("Players", "SetGlobalSpawnPoint", tm.players.SetSpawnPoint,
             _makeHostVec3(position.X, position.Y, position.Z))
     end
     return self
@@ -3199,7 +3327,7 @@ function World:SetTimeOfDayCycleDuration(seconds)
             "duration must be positive; got " .. tostring(seconds) .. "."), 0)
     end
     if tm and tm.world and tm.world.SetCycleDurationTimeOfDay then
-        pcall(tm.world.SetCycleDurationTimeOfDay, seconds)
+        _hostCallWarn("World", "SetTimeOfDayCycleDuration", tm.world.SetCycleDurationTimeOfDay, seconds)
     end
     return self
 end
@@ -3252,7 +3380,7 @@ function Camera:Add(player, name, position, rotation)
         hostRot = _makeHostVec3(0, 0, 0)
     end
     if tm and tm.players and tm.players.AddCamera then
-        pcall(tm.players.AddCamera, id, name, hostPos, hostRot)
+        _hostCallWarn("Camera", "Add", tm.players.AddCamera, id, name, hostPos, hostRot)
     end
     return self
 end
@@ -3264,7 +3392,7 @@ function Camera:Activate(player, name)
     local id = _cameraPlayerId("Activate", player)
     _expectType("Camera", "Activate", "name", "string", name)
     if tm and tm.players and tm.players.ActivateCamera then
-        pcall(tm.players.ActivateCamera, id, name)
+        _hostCallWarn("Camera", "Activate", tm.players.ActivateCamera, id, name)
     end
     return self
 end
@@ -3276,7 +3404,7 @@ function Camera:Remove(player, name)
     local id = _cameraPlayerId("Remove", player)
     _expectType("Camera", "Remove", "name", "string", name)
     if tm and tm.players and tm.players.RemoveCamera then
-        pcall(tm.players.RemoveCamera, id, name)
+        _hostCallWarn("Camera", "Remove", tm.players.RemoveCamera, id, name)
     end
     return self
 end
