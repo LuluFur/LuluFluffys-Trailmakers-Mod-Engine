@@ -3740,6 +3740,55 @@ function LFTME.New()
     return self
 end
 
+-- Load and run a sequence of module files from `data_static/`, in the
+-- given order. Each module is loaded via `tm.os.DoFile` and must return
+-- a non-nil value (typically a table). If any module fails to parse,
+-- throws an error, or returns nothing, a FATAL line is logged, an error
+-- is broadcast to chat, and the whole LoadModules call ABORTS -- the
+-- caller's code does not resume, and remaining modules are not loaded.
+-- This fail-fast design makes broken module chains impossible to ignore.
+-- If the host's `tm.os.DoFile` is not available (some test harnesses,
+-- some Trailmakers builds), LoadModules returns an empty table and logs
+-- a warning -- it does not crash.
+--
+-- Modules must be flat files in `data_static/`. No subfolders. The engine
+-- does not discover modules -- you must explicitly list them. Files are
+-- loaded synchronously in the order given, so you can declare dependencies
+-- by listing them in dependency order.
+--
+-- Example:
+--   local modules = engine:LoadModules({"core", "tags", "items"})
+--   print(modules.core, modules.tags, modules.items)
+function Engine:LoadModules(names)
+    _expectType("Engine", "LoadModules", "names", "table", names)
+    local Logger = self:GetService("Logger")
+    local Chat = self:GetService("Chat")
+    local modules = {}
+    -- Guard against absent tm.os.DoFile (some Trailmakers builds or test harnesses)
+    if not (tm and tm.os and tm.os.DoFile) then
+        Logger:Warn("LoadModules: host tm.os.DoFile not available; no modules loaded.")
+        return modules
+    end
+    for _, name in ipairs(names) do
+        _expectType("Engine", "LoadModules", "names[i]", "string", name)
+        local success, result = pcall(tm.os.DoFile, name .. ".lua")
+        if not success then
+            local msg = "module \"" .. name .. "\" failed to parse: " .. tostring(result)
+            Logger:Error(msg)
+            Chat:BroadcastToAll():Header("Error"):Body("[LoadModules] " .. msg):Duration(10)
+            error(_runtimeError("Engine", "LoadModules", msg), 0)
+        end
+        if result == nil then
+            local msg = "module \"" .. name .. "\" returned nil instead of a module table."
+            Logger:Error(msg)
+            Chat:BroadcastToAll():Header("Error"):Body("[LoadModules] " .. msg):Duration(10)
+            error(_runtimeError("Engine", "LoadModules", msg), 0)
+        end
+        modules[name] = result
+    end
+    return modules
+end
+
 -- Return the existing engine, or `(nil, err)` if `New()` has not been
 -- called yet. Never throws -- safe to call from helper libraries that
 -- do not know whether the engine is up yet.

@@ -59,6 +59,25 @@ Services are singletons within the single engine instance. Two `:GetService` cal
 
 In examples throughout this document, the engine instance variable is always called `engine`. The full namespace name `LuluFluffysTrailmakersModEngine` is used for namespaced references (`LuluFluffysTrailmakersModEngine.Patterns:Register`, `LuluFluffysTrailmakersModEngine.MarkupText.new`). The short `LFTME` alias appears only at the construction site, because once the instance is in a local variable, the namespace name no longer appears in user code.
 
+### Module loading
+
+Mods that split their code across multiple files use `engine:LoadModules({"core", "tags", ...})` to load them in order. Each name is passed to the host's `tm.os.DoFile` and must return a non-nil value (typically a table containing the module's public interface):
+
+```lua
+local modules = engine:LoadModules({"core", "helpers", "items"})
+local core = modules.core
+local helpers = modules.helpers
+local items = modules.items
+```
+
+Modules must be flat files in `data_static/`. No subfolders. The engine does not discover modules — you must explicitly list them. Files are loaded synchronously, so you can declare dependencies by listing them in dependency order.
+
+**Failure behaviour — fail-fast aborts.** If any module fails to parse, throws an error, or returns `nil`, LoadModules immediately aborts the entire call: a FATAL line is logged through `Logger:Error`, an error is broadcast through `Chat:BroadcastToAll` so the failure is visible in-game, and the whole `LoadModules` call raises an error. The remaining modules on your list are never attempted. This fail-fast design makes broken module chains impossible to ignore — a mod that fails to load a required module will not start with half its dependencies missing.
+
+The LoadModules call returns a table keyed by the module names you passed, in the order you listed them, only if all modules load successfully. If any module is missing from your list or fails to load, callers should wrap the call in a `pcall` if they want to recover from the error; otherwise the error propagates up and stops mod execution.
+
+**When the host's `tm.os.DoFile` is unavailable** (some Trailmakers builds or test harnesses), LoadModules logs a warning and returns an empty table. This is a graceful degradation for tools that don't have a file loader, not a silent failure — you will see the warning in logs.
+
 ## 3. Naming and casing conventions
 
 The engine uses four casing styles, each with a single dedicated role. Mixing them on purpose is how a reader tells public surface from internal state at a glance.
