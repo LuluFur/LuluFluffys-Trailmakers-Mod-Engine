@@ -750,7 +750,7 @@ function Logger:SetBufferSize(n)
             'buffer size must be a positive integer, got ' .. tostring(n)), 0)
     end
     self._bufferSize = n
-    self._lines = {}
+    for i = 1, #self._lines do self._lines[i] = nil end
     self._count = 0
     self._pos = 1
     return self
@@ -911,6 +911,7 @@ function Logger:Error(message, ...) self:_emit("Error", message, ...) end
 -- fresh. NOTE: this does not delete the file on disk yet. If you want
 -- the file empty right now, follow `Clear()` with `Logger:Flush()`.
 function Logger:Clear()
+    for i = 1, #self._lines do self._lines[i] = nil end
     self._count = 0
     self._pos = 1
     return self
